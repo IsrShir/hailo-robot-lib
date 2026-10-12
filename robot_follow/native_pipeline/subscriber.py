@@ -241,18 +241,18 @@ class NativePipelineSubscriber:
         # hailo15_pipeline.py:730-737.
         target_id = self._target_state.get_target() if self._target_state else None
         if target_id is not None and target_id in track_by_id:
-            follow_det = track_by_id[target_id]
+            followed_id = target_id
         elif track_by_id:
-            follow_det = max(
-                track_by_id.values(),
-                key=lambda d: d.bbox_height * d.confidence,
+            followed_id = max(
+                track_by_id,
+                key=lambda i: track_by_id[i].bbox_height * track_by_id[i].confidence,
             )
         else:
-            follow_det = None
+            followed_id = None
+        follow_det = track_by_id.get(followed_id)
 
         self._shared_state.update(follow_det, available_ids=tracked_ids)
-        self._write_det_log(ui_dets, target_id=(
-            self._target_state.get_target() if self._target_state else None))
+        self._write_det_log(ui_dets, target_id=followed_id)
 
         # Per-frame stats for tiling verification. We attribute each
         # detection to the smallest active tile (self._tiles) it fully
@@ -262,9 +262,9 @@ class NativePipelineSubscriber:
         stats = _compute_tile_stats(ui_dets, self._tiles)
 
         if self._ui_state is not None:
-            following_id = (
-                self._target_state.get_target() if self._target_state else None
-            )
+            # Highlight whoever is actually being followed, including the
+            # biggest-person pick in AUTO (target_id is None then).
+            following_id = followed_id
             # commit=True advances _frame_seq so the SSE handler wakes up.
             # Without it the UI never sees new detections because its SSE
             # stream blocks on the seq counter (designed around the Python
