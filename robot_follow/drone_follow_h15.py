@@ -356,6 +356,7 @@ def main():
             zmq_endpoint=f"tcp://127.0.0.1:{args.zmq_port}",
             record_path=record_path,  # opens .jsonl sidecar when set
             tiles=active_tiles,
+            controller_config=controller_config,
         )
         video_bridge = NativeVideoBridge(ui_state)
     else:
@@ -473,6 +474,7 @@ def main():
                 zmq_endpoint=f"tcp://127.0.0.1:{args.zmq_port}",
                 record_path=record_path,
                 tiles=new_tiles,
+                controller_config=controller_config,
             )
             video_bridge = NativeVideoBridge(ui_state)
             ui_state.set_tiles(new_tiles)
