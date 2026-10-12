@@ -35,6 +35,7 @@ from robot_follow.robot_api.adapters.mavsdk_drone import (
     _reap_mavsdk_server,
     add_drone_args,
 )
+from robot_follow.robot_api import command_log
 from robot_follow.robot_api.orchestrator import run_robot_loop
 from robot_follow.pipeline_adapter.vision_branches import decide_branches
 from robot_follow.servers import FollowServer, OpenHDBridge
@@ -553,6 +554,8 @@ def main():
         """Run robot control in a background thread with its own asyncio loop."""
         if args.robot == "drone":
             adapter = MavsdkDroneAdapter(args, controller_config)
+            command_log.open_from_args(
+                args, dry_run=False, connection=getattr(args, "connection", None))
         elif args.robot == "rover":
             if rover_preinit is not None:
                 # Reuse the main-thread preinit (avoids the Hailo-plugin race).
@@ -612,6 +615,7 @@ def main():
                 exc_info=True,
             )
         finally:
+            command_log.close()
             loop.close()
 
     robot_thread = threading.Thread(target=run_robot,
