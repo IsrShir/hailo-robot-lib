@@ -744,3 +744,30 @@ class TestWaitForOffboard:
         assert adapter._offboard_monitor_task is None
         assert "[CMD] OFFBOARD never seen (FC telemetry lost) -- control not started" in lines
         assert not any("control starts" in line for line in lines)
+
+
+# ---------------------------------------------------------------------------
+# mavsdk_server lookup (Hailo15 image has it on PATH, not in mavsdk/bin)
+# ---------------------------------------------------------------------------
+
+def test_find_mavsdk_server_falls_back_to_path(monkeypatch, tmp_path):
+    from robot_follow.robot_api.adapters import mavsdk_drone as md
+    fake_pkg = tmp_path / "mavsdk"
+    fake_pkg.mkdir()
+    monkeypatch.setattr(md.mavsdk, "__file__", str(fake_pkg / "__init__.py"))
+    bin_dir = tmp_path / "usr_bin"
+    bin_dir.mkdir()
+    server = bin_dir / "mavsdk_server"
+    server.write_text("#!/bin/sh\n")
+    server.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir))
+    assert md._find_mavsdk_server() == str(server)
+
+
+def test_find_mavsdk_server_prefers_bundled(monkeypatch, tmp_path):
+    from robot_follow.robot_api.adapters import mavsdk_drone as md
+    bundled = tmp_path / "mavsdk" / "bin" / "mavsdk_server"
+    bundled.parent.mkdir(parents=True)
+    bundled.write_text("")
+    monkeypatch.setattr(md.mavsdk, "__file__", str(tmp_path / "mavsdk" / "__init__.py"))
+    assert md._find_mavsdk_server() == str(bundled)

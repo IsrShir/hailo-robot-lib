@@ -13,27 +13,52 @@ Reference for running `drone_follow_h15` on the Hailo15 target.
 | `/var/run/drone-follow.pid` | PID file while service is running |
 | `/home/root/robot_follow/` | Synced Python package |
 | `/home/root/robot_follow/ui/build/` | Built React UI |
+| `/home/root/native_pipeline/df_native_pipeline` | Native detection pipeline binary (`--native-pipeline`) |
+| `/usr/lib/python3.10/site-packages/zmq/`, `pyzmq.libs/` | pyzmq (not in the image; installed by `install_pyzmq.sh`) |
 | `/home/root/recordings/` | Video recordings (`.mkv`) + detection logs (`.jsonl`) |
 | `/home/root/df_config.json` | Saved controller config (if "Save Config" pressed in UI) |
+
+## Board prerequisites
+
+The target must run an image built with the **phys-ai** kas config
+(`hailo-yocto-validation`: `kas/CI/hailo15l-sbc-vpu-phys-ai.yml`, or `PHYS_AI_SUPPORT` in Kconfig),
+target `core-image-hailo-dev`. A normal Hailo15 image has no mavsdk / pymavlink.
+Once per board, select the camera sensor on the target: `setup_hailo_sensor.sh`.
+
+Build the native pipeline binary on the host before installing
+(needs the Hailo Yocto SDK, `/opt/poky/<ver>`):
+```bash
+cd robot_follow/native_pipeline && ./build.sh
+```
 
 ## Installation (from build host)
 
 ```bash
 cd hailo-drone-follow/scripts/h15_boot
 
-./install.sh                          # full install: UI build + app + service (target=root@10.0.0.1)
+./install.sh                          # full install (target=root@10.0.0.1)
 ./install.sh root@<ip>                # custom target
 TARGET=root@<ip> ./install.sh         # via env var
+SSH_OPTS="-o ProxyCommand=none" ./install.sh   # host whose ssh goes through sss_ssh_knownhostsproxy
+SKIP_UI_BUILD=1 ./install.sh          # reuse existing robot_follow/ui/build (no npm)
 
 ./build_ui.sh                         # just rebuild React UI (robot_follow/ui/build/)
 ./install_app.sh                      # just sync robot_follow/ code (assumes UI already built)
-./install_service.sh                  # just install/refresh init service
+./install_native.sh                   # just copy native_pipeline/build/df_native_pipeline
+./install_pyzmq.sh                    # just install pyzmq (skipped if already there)
+./install_service.sh                  # just install/refresh init service (keeps existing args)
+RESET_ARGS=1 ./install_service.sh     # ... and reset /etc/default/drone-follow to the repo default
+./check_board.sh                      # read-only check that the target has everything (PASS/WARN/FAIL)
 ./uninstall.sh                        # remove service files (keeps log)
 ./install_usb_automount.sh            # one-time setup of USB auto-mount at /mnt/usb
 ```
 
-The full `install.sh` runs `build_ui.sh`, then `install_app.sh`, then `install_service.sh`.
+The full `install.sh` runs `build_ui.sh`, `install_app.sh`, `install_native.sh`,
+`install_pyzmq.sh`, `install_service.sh` and `check_board.sh`.
 Run `build_ui.sh` standalone whenever you change `robot_follow/ui/src/`.
+
+`install_pyzmq.sh` downloads the official `pyzmq` manylinux aarch64 wheel with the host's pip
+and copies `zmq/` + `pyzmq.libs/` into the target's site-packages (the target has no pip).
 
 ## Service control (on target)
 

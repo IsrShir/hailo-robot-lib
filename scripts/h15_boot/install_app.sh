@@ -7,15 +7,13 @@
 #   TARGET=root@<ip> ./install_app.sh
 
 set -e
-
-TARGET=${1:-${TARGET:-root@10.0.0.1}}
-REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+source "$(dirname "$0")/common.sh"
 
 echo "=== Syncing robot_follow app to $TARGET ==="
 echo "  from: $REPO_ROOT/robot_follow/"
 echo "  to:   $TARGET:/home/root/robot_follow/"
 
-rsync -av \
+target_rsync -av \
     --exclude='__pycache__' \
     --exclude='*.pyc' \
     --exclude='*.egg-info' \
@@ -37,6 +35,6 @@ fi
 # One-time cleanup: if a previous deploy left /home/root/drone_follow/ on
 # the target, remove it so stale .pyc/__pycache__ entries can't be picked
 # up ahead of the new robot_follow/ tree by Python's import system.
-ssh "$TARGET" "[ -d /home/root/drone_follow ] && rm -rf /home/root/drone_follow && echo 'Removed stale /home/root/drone_follow/' || true"
+target_ssh "[ -d /home/root/drone_follow ] && rm -rf /home/root/drone_follow && echo 'Removed stale /home/root/drone_follow/' || true"
 
 echo "Done."

@@ -4,12 +4,11 @@
 # Usage: ./uninstall.sh [root@<ip>]
 
 set -e
-
-TARGET=${1:-${TARGET:-root@10.0.0.1}}
+source "$(dirname "$0")/common.sh"
 
 echo "=== Uninstalling drone-follow init service from $TARGET ==="
 
-ssh "$TARGET" "
+target_ssh "
     [ -f /etc/init.d/drone-follow ] && /etc/init.d/drone-follow stop 2>/dev/null
     rm -f /etc/rcS.d/S99drone-follow
     rm -f /etc/init.d/drone-follow
