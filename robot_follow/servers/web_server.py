@@ -484,8 +484,43 @@ class _WebHandler(BaseHTTPRequestHandler):
             self._handle_record_stop()
         elif self.path == "/api/tiles":
             self._handle_post_tiles()
+        elif self.path.startswith("/api/follow/"):
+            self._proxy_follow()
         else:
             self.send_error(404, "Not Found")
+
+    def _proxy_follow(self):
+        """Forward POST /api/follow/<id|clear> to the FollowServer on this host.
+
+        The UI posts clicks to its own origin so they work through any ssh
+        tunnel port; the FollowServer keeps the click logic (bbox IoU
+        recovery, target-size capture).
+        """
+        import urllib.error
+        import urllib.request
+        if self.follow_server_port == self.server.server_address[1]:
+            # Follow routes are served on this port by the app itself
+            # (drone_follow_h15 patches do_POST); forwarding would loop.
+            self.send_error(404, "Not Found")
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length) if length else None
+        url = f"http://127.0.0.1:{self.follow_server_port}{self.path[len('/api'):]}"
+        req = urllib.request.Request(url, data=body, method="POST",
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=2.0) as resp:
+                status, data = resp.status, resp.read()
+        except urllib.error.HTTPError as e:
+            status, data = e.code, e.read()
+        except OSError as e:
+            self._send_json({"status": "error", "error": f"follow server: {e}"}, status=502)
+            return
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 
     def _handle_config_save(self):
         """Dump the live ControllerConfig to df_config.json on the air unit."""

@@ -347,15 +347,15 @@ export default function App() {
     }
     if (pick.id == null) return;
     try {
-      const port = config?.follow_server_port || 8080;
-      const host = window.location.hostname;
+      // Same-origin /api/follow/ so the click reaches the server that serves
+      // this page whatever host:port the browser uses (e.g. an ssh tunnel).
       // Send the full bbox geometry so the server can: (a) write target_bbox_height
       // from .h directly (bypassing the SharedUIState race [03-15]); and (b) when
       // the requested id has drifted between SSE render and HTTP arrival, match
       // the clicked bbox against shared_state's atomic id→bbox snapshot and
       // recover by geometric overlap (IoU) [03-16] — the operator's click is the
       // visual identification, regardless of which id was current at any layer.
-      await fetch(`http://${host}:${port}/follow/${pick.id}`, {
+      await fetch(`/api/follow/${pick.id}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ bbox: { x: pick.bbox.x, y: pick.bbox.y, w: pick.bbox.w, h: pick.bbox.h } }),
@@ -380,9 +380,7 @@ export default function App() {
 
   const handleClear = async () => {
     try {
-      const port = config?.follow_server_port || 8080;
-      const host = window.location.hostname;
-      await fetch(`http://${host}:${port}/follow/clear`, { method: "POST" });
+      await fetch("/api/follow/clear", { method: "POST" });
     } catch {
       // ignore
     }
