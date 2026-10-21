@@ -285,6 +285,9 @@ def add_drone_args(parser) -> None:
                             "Default: off — stream zero setpoints and wait for the operator to switch "
                             "to OFFBOARD via the GCS. Manual handshake is the safer choice for real-drone "
                             "flights; auto-offboard is appropriate for SITL / bench tests.")
+    group.add_argument("--log-commands", action="store_true",
+                       help="Log every velocity setpoint sent to the FC ([CMD] lines, one per "
+                            "control tick, ~10/s) plus why commands are skipped. Default: off.")
     group.add_argument("--target-altitude", type=float, default=3.0,
                        help="Target altitude in metres (default: 3.0). Also used as takeoff height with --takeoff-landing.")
     group.add_argument("--mission-duration", type=float, default=300.0,
@@ -605,6 +608,28 @@ class MavsdkDroneAdapter:
         # flips this flag; the auto-offboard path leaves it True.
         self._offboard_active: bool = True
         self._offboard_monitor_task: Optional[asyncio.Task] = None
+        self._log_commands: bool = bool(getattr(args, "log_commands", False))
+        self._last_skip: Optional[str] = None  # last logged skip reason
+
+    def _log_sent(self, kind: str, sent: RobotCommand,
+                  requested: Optional[RobotCommand] = None) -> None:
+        """--log-commands: one [CMD] line per setpoint actually sent."""
+        if not self._log_commands:
+            return
+        self._last_skip = None
+        msg = (f"[CMD] {kind} fwd={sent.forward_m_s:+.2f} m/s "
+               f"down={sent.down_m_s:+.2f} m/s yaw={sent.yaw_rate:+.1f} deg/s")
+        if requested is not None:
+            msg += (f" (controller: fwd={requested.forward_m_s:+.2f} "
+                    f"down={requested.down_m_s:+.2f} yaw={requested.yaw_rate:+.1f})")
+        LOGGER.info(msg)
+
+    def _log_skip(self, reason: str) -> None:
+        """--log-commands: log why nothing was sent, once per change of reason."""
+        if not self._log_commands or reason == self._last_skip:
+            return
+        self._last_skip = reason
+        LOGGER.info("[CMD] not sent: %s", reason)
 
     async def connect(self) -> None:
         """Open MAVSDK gRPC. Raises ConnectionError on timeout.
@@ -750,10 +775,13 @@ class MavsdkDroneAdapter:
         re-engages OFFBOARD.
         """
         if safety_ctx.target_lost:
+            self._log_skip("target lost")
             return
         if not self._offboard_active:
+            self._log_skip("not in OFFBOARD (pilot has control)")
             return  # pilot has manual control; do not fight them
         if self._drone is None:
+            self._log_skip("no FC connection")
             return  # connect failed; silently skip
         down = _apply_altitude_p(cmd.down_m_s, self._altitude_cache, self._config)
         forward = _apply_retreat_from_tilt(cmd.forward_m_s, safety_ctx, self._config)
@@ -770,6 +798,7 @@ class MavsdkDroneAdapter:
             smoothed.yaw_rate,  # already deg/s per DRONE_CAPS.yaw_unit (Q5 lock)
         )
         await self._drone.offboard.set_velocity_body(vbys)
+        self._log_sent("follow", smoothed, requested=cmd)
 
     async def send_zero(self) -> None:
         """Quiescent zero setpoint + reset smoothing state.
@@ -782,17 +811,21 @@ class MavsdkDroneAdapter:
         await self._drone.offboard.set_velocity_body(
             VelocityBodyYawspeed(0.0, 0.0, 0.0, 0.0)
         )
+        self._log_sent("stop", RobotCommand())
 
     async def on_target_lost(self, last_detection: Optional[Detection]) -> None:
         """Drone's lost-target behavior: yaw-spin in last bbox direction."""
         if not self._offboard_active:
+            self._log_skip("not in OFFBOARD (pilot has control)")
             return  # pilot has manual control; do not fight them
         yawspeed_deg_s = _compute_search_yawspeed(last_detection, self._config)
         if self._drone is None:
+            self._log_skip("no FC connection")
             return
         await self._drone.offboard.set_velocity_body(
             VelocityBodyYawspeed(0.0, 0.0, 0.0, yawspeed_deg_s)
         )
+        self._log_sent("search", RobotCommand(yaw_rate=yawspeed_deg_s))
 
     async def shutdown(self) -> None:
         """Idempotent. Cancel telemetry, land if armed, exit context."""
