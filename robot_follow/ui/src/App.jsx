@@ -11,6 +11,77 @@ const OVERLAY_SMOOTH_ALPHA = 0.5;
 const CROSS_HALF_SIZE = 10; // pixels, half the arm length of the cross
 const CROSS_STROKE = 3;
 const CROSS_HALO_STROKE = 6;
+// Whole-frame default tile geometry (4 overlapping quadrants + full frame).
+// POSTed to /api/tiles to revert inference to the whole frame once the
+// operator clears all hand-drawn regions. Mirrors DEFAULT_TILES on the
+// Python side (subscriber.py) and the C++ framework default.
+const DEFAULT_TILE_SPEC =
+  "0,0,0.6,0.6;0.4,0,0.6,0.6;0,0.4,0.6,0.6;0.4,0.4,0.6,0.6;0,0,1,1";
+// Ignore rubber-band drags smaller than this (normalized) — treats an
+// accidental click as "cancel" rather than a zero-area region.
+const MIN_REGION_SIZE = 0.02;
+// Network input dimensions (YOLOv8s hailo_yolov8s_384_640.hef → 640×384 WxH).
+// The DSP crop-resize is a plain stretch to these dims, so a crop whose pixel
+// aspect already matches gets scaled uniformly (no warp). We expand each drawn
+// region to this aspect before sending it as a tile — see expandToNetAspect().
+const NET_INPUT_W = 640;
+const NET_INPUT_H = 384;
+
+// --- regions ⇄ tiles ----------------------------------------------------
+// "regions" are the ORIGINAL rectangles the operator draws/edits. The pipeline
+// "tiles" are those regions expanded to the network aspect (the padded crops
+// fed to the chip), plus the ≥2-tile rule (a lone region → two identical
+// tiles). regions→tiles happens in buildTiles() at apply time; tiles→regions
+// (dedupe) runs once on load/SSE so a reload still shows the active tiles.
+// (Expansion is idempotent, so a region reconstructed from a padded tile and
+// re-expanded is unchanged.)
+
+// Parse "x,y,w,h;x,y,w,h;..." (optional "name=" prefix) → [{x,y,w,h}].
+function parseSpecToRegions(spec) {
+  const out = [];
+  for (const raw of String(spec).split(";")) {
+    const s = raw.trim();
+    if (!s) continue;
+    const nums = s.replace(/^[^=]*=/, "").split(",").map((n) => Number(n.trim()));
+    if (nums.length !== 4 || nums.some((n) => !Number.isFinite(n))) {
+      throw new Error(`bad tile "${s}" (need x,y,w,h)`);
+    }
+    const [x, y, w, h] = nums;
+    out.push({ x, y, w, h });
+  }
+  return out;
+}
+
+const regionsToSpec = (regs) =>
+  regs.map((r) => `${r.x},${r.y},${r.w},${r.h}`).join(";");
+
+// Remove exactly-duplicate rectangles (e.g. the single-region duplicate).
+function dedupeTiles(tiles) {
+  const seen = new Set();
+  const out = [];
+  for (const t of tiles) {
+    const k = [t.x, t.y, t.w, t.h].map((v) => Number(v).toFixed(4)).join(",");
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push({ x: t.x, y: t.y, w: t.w, h: t.h });
+  }
+  return out;
+}
+
+// The whole-frame default (4 quadrants + full). When the active tiles equal
+// this, there are no user regions — so tiles→regions yields an empty list.
+const DEFAULT_TILE_SET = parseSpecToRegions(DEFAULT_TILE_SPEC);
+function isDefaultTiles(regs) {
+  if (regs.length !== DEFAULT_TILE_SET.length) return false;
+  const key = (r) => [r.x, r.y, r.w, r.h].map((v) => Number(v).toFixed(3)).join(",");
+  const have = new Set(regs.map(key));
+  return DEFAULT_TILE_SET.every((r) => have.has(key(r)));
+}
+
+// A full-frame tile (always present in the pipeline tile set). Not a user
+// region — stripped when reconstructing regions from the active tiles.
+const isFullFrameTile = (t) =>
+  t.w >= 0.999 && t.h >= 0.999 && t.x <= 0.001 && t.y <= 0.001;
 
 export default function App() {
   const [detections, setDetections] = useState([]);
@@ -46,7 +117,25 @@ export default function App() {
   const [tileEditorOpen, setTileEditorOpen] = useState(false);
   const [tileSpecDraft, setTileSpecDraft] = useState("");
   const [tileApplyState, setTileApplyState] = useState({ status: "idle" });
+  // Hand-drawn inference regions. `regionArmed` is set by the "+" button /
+  // key and means "the next click-drag on the video defines a region".
+  // `regions` is the committed list ({x,y,w,h} normalized); when non-empty
+  // only these areas are inferred. `drawRect` is the live rubber-band during
+  // a drag. drawStartRef holds the drag origin so mouse-up can compute the
+  // final rect without depending on stale state.
+  const [regionArmed, setRegionArmed] = useState(false);
+  const [regions, setRegions] = useState([]);
+  const [drawRect, setDrawRect] = useState(null);
+  const [regionApplyState, setRegionApplyState] = useState({ status: "idle" });
+  const drawStartRef = useRef(null);
+  // Guards the one-time reconstruction of `regions` from the pipeline's active
+  // tiles on load (tiles→regions). After the first sync, `regions` is the
+  // local source of truth and isn't overwritten by the per-frame SSE tiles.
+  const regionsInitedRef = useRef(false);
   const canvasRef = useRef(null);
+  // Per-tile debug thumbnail canvases (index → <canvas>), populated by
+  // callback refs. Filled by the draw effect when "show tiles" is on.
+  const tileThumbRefs = useRef(new Map());
   const debounceRef = useRef(null);
   const logSinceRef = useRef(0);
   const logEndRef = useRef(null);
@@ -84,6 +173,19 @@ export default function App() {
         }
         if (Array.isArray(data.tiles) && data.tiles.length) {
           setTiles(data.tiles);
+          // One-time tiles→regions sync on load: reconstruct the region list
+          // from whatever tiles the pipeline is already running, so the UI
+          // reflects them (and "clear"/"edit" work) after a reload. Deduped
+          // (undoes the single-region duplicate); the whole-frame default maps
+          // to no regions. Skipped forever after — regions is local truth then.
+          if (!regionsInitedRef.current) {
+            regionsInitedRef.current = true;
+            const deduped = dedupeTiles(data.tiles);
+            // Strip the always-present full-frame tile — it isn't a user region.
+            if (!isDefaultTiles(deduped)) {
+              setRegions(deduped.filter((t) => !isFullFrameTile(t)));
+            }
+          }
         }
       } catch {
         // malformed event
@@ -459,13 +561,27 @@ export default function App() {
   const vw = videoDims.width;
   const vh = videoDims.height;
 
+  // "Edit tiles" edits the region list (same source of truth as draw/clear).
+  // Parse the spec into regions, sync them, and apply — so editing tiles and
+  // drawing regions stay equivalent.
   const applyTileSpec = async (spec) => {
+    let parsed;
+    try {
+      parsed = parseSpecToRegions(spec);
+    } catch (e) {
+      setTileApplyState({ status: "error", message: `Parse: ${e.message || e}` });
+      return;
+    }
+    setRegions(parsed);
     setTileApplyState({ status: "applying" });
+    const body = parsed.length === 0
+      ? { spec: DEFAULT_TILE_SPEC }
+      : { tiles: buildTiles(parsed) };
     try {
       const res = await fetch("/api/tiles", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ spec }),
+        body: JSON.stringify(body),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
@@ -489,6 +605,208 @@ export default function App() {
       setTileApplyState({ status: "error", message: String(e) });
     }
   };
+
+  // --- Hand-drawn inference regions --------------------------------------
+
+  // Convert a viewport pixel coordinate to normalized [0,1] frame coords,
+  // relative to the rendered video canvas. The canvas is width:100%/height:auto
+  // with the SVG overlay matching it exactly (no letterboxing), so the canvas
+  // client rect is the video rect.
+  const clientToNorm = useCallback((clientX, clientY) => {
+    const el = canvasRef.current;
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return null;
+    const nx = Math.min(1, Math.max(0, (clientX - r.left) / r.width));
+    const ny = Math.min(1, Math.max(0, (clientY - r.top) / r.height));
+    return { x: nx, y: ny };
+  }, []);
+
+  // Expand a drawn region so its CROP has the same pixel aspect ratio as the
+  // network input, so the DSP's stretch resize scales it uniformly (no warp).
+  // The extra area is filled with real neighbouring scene (not black). Growth
+  // is centred on the region and clamped to the frame; only the smaller axis
+  // grows, so the drawn region always stays fully inside the expanded crop.
+  const expandToNetAspect = (r) => {
+    const vw = videoDims.width || 16;
+    const vh = videoDims.height || 9;
+    // Target tile w/h in NORMALIZED coords = net pixel aspect ÷ frame pixel
+    // aspect. e.g. (640/384) / (1920/1080) = 0.9375 for a 16:9 frame.
+    const targetWH = (NET_INPUT_W / NET_INPUT_H) * (vh / vw);
+    let { x, y, w, h } = r;
+    if (w / h < targetWH) {
+      const newW = Math.min(1, h * targetWH); // too narrow → widen
+      x += (w - newW) / 2;
+      w = newW;
+    } else {
+      const newH = Math.min(1, w / targetWH); // too wide → grow height
+      y += (h - newH) / 2;
+      h = newH;
+    }
+    // Keep the (grown) box inside the frame. Shifting is safe: the box only
+    // grew, so the original region is still contained after clamping.
+    x = Math.max(0, Math.min(x, 1 - w));
+    y = Math.max(0, Math.min(y, 1 - h));
+    return { x, y, w, h };
+  };
+
+  // Build the pipeline tiles from the user's ORIGINAL regions. The full frame
+  // is ALWAYS included as a tile (so the whole scene is inferred regardless of
+  // regions), followed by each region expanded to the network aspect (the
+  // "padded" tile fed to the chip). Regions themselves stay the original drawn
+  // shapes — this is the only place expansion happens, so the overlay shows
+  // originals while "show tiles" shows these padded tiles. The always-present
+  // full tile also satisfies the pipeline's ≥2-tile rule for a single region
+  // (full + region), so no duplicate is needed. expandToNetAspect is
+  // idempotent (re-expanding a padded region reconstructed from SSE is a no-op).
+  const buildTiles = (regs) => [
+    { name: "FULL", x: 0, y: 0, w: 1, h: 1 },
+    ...regs.map((r, i) => ({ name: `R${i + 1}`, ...expandToNetAspect(r) })),
+  ];
+
+  // POST the current region set to the pipeline. Empty list → revert to the
+  // whole-frame default. Triggers a brief pipeline restart on the backend.
+  const applyRegions = async (regs) => {
+    const body = regs.length === 0
+      ? { spec: DEFAULT_TILE_SPEC }
+      : { tiles: buildTiles(regs) };
+    setRegionApplyState({ status: "applying" });
+    try {
+      const res = await fetch("/api/tiles", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setRegionApplyState({
+          status: "error",
+          message: data.error || `HTTP ${res.status}`,
+        });
+        return;
+      }
+      setRegionApplyState({
+        status: "applied",
+        message: regs.length === 0
+          ? "whole frame"
+          : `${regs.length} region${regs.length > 1 ? "s" : ""}`,
+      });
+      setTimeout(() => setRegionApplyState({ status: "idle" }), 2500);
+    } catch (e) {
+      setRegionApplyState({ status: "error", message: String(e) });
+    }
+  };
+
+  const onRegionMouseDown = (e) => {
+    const p = clientToNorm(e.clientX, e.clientY);
+    if (!p) return;
+    drawStartRef.current = p;
+    setDrawRect({ x: p.x, y: p.y, w: 0, h: 0 });
+  };
+
+  const onRegionMouseMove = (e) => {
+    const s = drawStartRef.current;
+    if (!s) return;
+    const p = clientToNorm(e.clientX, e.clientY);
+    if (!p) return;
+    setDrawRect({
+      x: Math.min(s.x, p.x),
+      y: Math.min(s.y, p.y),
+      w: Math.abs(p.x - s.x),
+      h: Math.abs(p.y - s.y),
+    });
+  };
+
+  const onRegionMouseUp = (e) => {
+    const s = drawStartRef.current;
+    drawStartRef.current = null;
+    setDrawRect(null);
+    setRegionArmed(false);
+    if (!s) return;
+    const p = clientToNorm(e.clientX, e.clientY) || s;
+    const rect = {
+      x: Math.min(s.x, p.x),
+      y: Math.min(s.y, p.y),
+      w: Math.abs(p.x - s.x),
+      h: Math.abs(p.y - s.y),
+    };
+    if (rect.w < MIN_REGION_SIZE || rect.h < MIN_REGION_SIZE) return; // cancel
+    // Store the ORIGINAL drawn rect — the overlay shows exactly what you drew.
+    // Expansion to the network aspect (the padded tile fed to the chip) happens
+    // only in buildTiles() at apply time and is shown under "show tiles".
+    const next = [...regions, rect];
+    setRegions(next);
+    applyRegions(next);
+  };
+
+  const onRegionMouseLeave = () => {
+    // Abort the in-progress drag but stay armed so the operator can retry.
+    drawStartRef.current = null;
+    setDrawRect(null);
+  };
+
+  const clearRegions = () => {
+    setRegionArmed(false);
+    setDrawRect(null);
+    drawStartRef.current = null;
+    setRegions([]);
+    applyRegions([]);
+  };
+
+  // "+" arms region drawing; Escape cancels. Ignored while typing in a field.
+  useEffect(() => {
+    const onKey = (e) => {
+      const tag = (e.target?.tagName || "").toLowerCase();
+      if (tag === "input" || tag === "textarea") return;
+      if (e.key === "+" || e.key === "=") {
+        e.preventDefault();
+        setRegionArmed((v) => !v);
+      } else if (e.key === "Escape") {
+        setRegionArmed(false);
+        setDrawRect(null);
+        drawStartRef.current = null;
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  // Debug: reconstruct each pipeline tile's chip-input image (crop → resize to
+  // the 640×384 target) from the live display frame while "show tiles" is on.
+  // This mirrors the crop/resize geometry the NPU receives (aspect, framing,
+  // any edge-clamp warp) — faithful for geometry, though sourced from the
+  // display frame, not the literal NV12 buffer on the DSP. There's no black
+  // padding to show: the expand-to-aspect crop is scaled uniformly.
+  useEffect(() => {
+    if (!showTiles || !tiles.length) return undefined;
+    let raf;
+    let last = 0;
+    const draw = (ts) => {
+      raf = requestAnimationFrame(draw);
+      if (ts - last < 120) return; // throttle to ~8 fps
+      last = ts;
+      const src = canvasRef.current;
+      if (!src || !src.width) return;
+      tiles.forEach((t, i) => {
+        const cv = tileThumbRefs.current.get(i);
+        const g = cv && cv.getContext("2d");
+        if (!g) return;
+        g.fillStyle = "#000";
+        g.fillRect(0, 0, cv.width, cv.height);
+        const sx = t.x * src.width;
+        const sy = t.y * src.height;
+        const sw = Math.max(1, t.w * src.width);
+        const sh = Math.max(1, t.h * src.height);
+        try {
+          g.drawImage(src, sx, sy, sw, sh, 0, 0, cv.width, cv.height);
+        } catch {
+          // frame not ready yet
+        }
+      });
+    };
+    raf = requestAnimationFrame(draw);
+    return () => cancelAnimationFrame(raf);
+  }, [showTiles, tiles]);
 
   const TILE_PRESETS = [
     {
@@ -915,6 +1233,84 @@ export default function App() {
           ref={canvasRef}
           className="video-feed"
         />
+        {/* Inference-region toolbar. "+ Add region" arms a click-drag on the
+            video that defines an area to run inference on. Drawing an area
+            replaces whole-frame inference with just the selected region(s);
+            "Clear regions" reverts to the whole frame. Also bindable via the
+            "+" key. */}
+        <div
+          style={{
+            position: "absolute",
+            top: 4,
+            left: 4,
+            display: "flex",
+            gap: 6,
+            alignItems: "center",
+            zIndex: 20,
+            fontFamily: "monospace",
+            fontSize: 12,
+          }}
+        >
+          <button
+            onClick={() => setRegionArmed((v) => !v)}
+            title="Press + then click-drag on the video to select an inference area"
+            style={{
+              background: regionArmed ? "#1b6" : "rgba(0,0,0,0.55)",
+              color: "#fff",
+              border: "1px solid #888",
+              borderRadius: 3,
+              padding: "3px 8px",
+              cursor: "pointer",
+              fontFamily: "monospace",
+              fontSize: 12,
+            }}
+          >
+            {regionArmed ? "Click-drag to select…" : "＋ Add region"}
+          </button>
+          {regions.length > 0 && (
+            <button
+              onClick={clearRegions}
+              style={{
+                background: "rgba(0,0,0,0.55)",
+                color: "#fff",
+                border: "1px solid #888",
+                borderRadius: 3,
+                padding: "3px 8px",
+                cursor: "pointer",
+                fontFamily: "monospace",
+                fontSize: 12,
+              }}
+            >
+              Clear regions ({regions.length})
+            </button>
+          )}
+          {regionApplyState.status === "applying" && (
+            <span style={{ color: "#ffd54f" }}>applying…</span>
+          )}
+          {regionApplyState.status === "applied" && (
+            <span style={{ color: "#80f060" }}>{regionApplyState.message}</span>
+          )}
+          {regionApplyState.status === "error" && (
+            <span style={{ color: "#ff8080" }}>{regionApplyState.message}</span>
+          )}
+        </div>
+        {/* Transparent capture layer — only mounted while armed. Sits above
+            the video + SVG so it intercepts the drag (and blocks detection
+            click-to-follow) while a region is being drawn. */}
+        {regionArmed && (
+          <div
+            onMouseDown={onRegionMouseDown}
+            onMouseMove={onRegionMouseMove}
+            onMouseUp={onRegionMouseUp}
+            onMouseLeave={onRegionMouseLeave}
+            style={{
+              position: "absolute",
+              inset: 0,
+              zIndex: 10,
+              cursor: "crosshair",
+            }}
+          />
+        )}
         {/* Tile stats badge. Shows the per-frame detection count + smallest
             bbox + per-tile attribution, plus toggles for the tile-boundary
             overlay and the [edit tiles] modal. Only renders in native
@@ -968,10 +1364,13 @@ export default function App() {
                   opacity: 0.8,
                 }}
                 onClick={() => {
+                  // Seed the editor from the current regions (the source of
+                  // truth). Editing here updates regions, keeping the two in
+                  // sync. Empty → the current active tiles as a starting point.
                   setTileSpecDraft(
-                    tiles
-                      .map((t) => `${t.x},${t.y},${t.w},${t.h}`)
-                      .join(";"),
+                    regions.length
+                      ? regionsToSpec(regions)
+                      : tiles.map((t) => `${t.x},${t.y},${t.w},${t.h}`).join(";"),
                   );
                   setTileEditorOpen(true);
                 }}
@@ -1018,6 +1417,45 @@ export default function App() {
                   </g>
                 );
               })}
+            {/* Inference regions — the ORIGINAL shapes the operator drew.
+                The padded tiles actually fed to the chip (each expanded to the
+                640×384 aspect) render separately under the "show tiles" toggle
+                and in the debug strip below the video. */}
+            {regions.map((r, i) => (
+              <g key={`roi-${i}`}>
+                <rect
+                  x={r.x * vw}
+                  y={r.y * vh}
+                  width={r.w * vw}
+                  height={r.h * vh}
+                  fill="none"
+                  stroke="#00e5ff"
+                  strokeWidth={3}
+                  opacity={0.9}
+                />
+                <text
+                  x={r.x * vw + 6}
+                  y={r.y * vh + 20}
+                  fill="#00e5ff"
+                  fontSize={16}
+                  fontFamily="monospace"
+                >
+                  ROI {i + 1}
+                </text>
+              </g>
+            ))}
+            {drawRect && (
+              <rect
+                x={drawRect.x * vw}
+                y={drawRect.y * vh}
+                width={drawRect.w * vw}
+                height={drawRect.h * vh}
+                fill="rgba(0,229,255,0.15)"
+                stroke="#00e5ff"
+                strokeWidth={2}
+                strokeDasharray="6 4"
+              />
+            )}
             {detections.map((det, i) => {
               const isFollowing =
                 det.id != null && det.id === followingId;
@@ -1114,6 +1552,65 @@ export default function App() {
           </svg>
         )}
           </div>
+
+          {/* Debug: the actual chip inputs (each tile cropped + resized to the
+              640×384 network input). Shown with "show tiles". Includes the
+              single-region duplicate, so you see exactly what's fed per frame. */}
+          {showTiles && tiles.length > 0 && (
+            <div
+              style={{
+                display: "flex",
+                flexWrap: "wrap",
+                gap: 8,
+                marginTop: 8,
+                padding: 8,
+                background: "#1a1a1a",
+                borderRadius: 6,
+              }}
+            >
+              <div
+                style={{
+                  width: "100%",
+                  fontFamily: "monospace",
+                  fontSize: 11,
+                  color: "#888",
+                }}
+              >
+                Chip inputs — each tile cropped &amp; resized to 640×384
+                (reconstructed from the display frame):
+              </div>
+              {tiles.map((t, i) => (
+                <div key={`thumb-${i}`} style={{ textAlign: "center" }}>
+                  <canvas
+                    width={240}
+                    height={144}
+                    ref={(el) => {
+                      if (el) tileThumbRefs.current.set(i, el);
+                      else tileThumbRefs.current.delete(i);
+                    }}
+                    style={{
+                      width: 200,
+                      height: 120,
+                      background: "#000",
+                      border: "1px solid #00e5ff",
+                      borderRadius: 3,
+                      display: "block",
+                    }}
+                  />
+                  <div
+                    style={{
+                      fontFamily: "monospace",
+                      fontSize: 10,
+                      color: "#aaa",
+                      marginTop: 2,
+                    }}
+                  >
+                    {t.name} · {(t.w * 100).toFixed(0)}×{(t.h * 100).toFixed(0)}%
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
 
           <div className="logs-panel side-card">
             <button
