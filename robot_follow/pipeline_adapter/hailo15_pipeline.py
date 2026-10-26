@@ -218,6 +218,7 @@ class Hailo15PipelineApp:
         self.pipeline = None
         self._frontend_config_path = None
         self._frame_count = 0
+        self._last_follow = None  # (mode, id) last logged by _log_follow_change
         self._recording = False
 
         # ByteTracker for consistent IDs (optional — requires scipy)
@@ -381,8 +382,42 @@ class Hailo15PipelineApp:
         if appsink:
             appsink.connect("new-sample", self._on_new_sample)
 
-    def _write_detection_log(self, detections, following_id, raw_count=None, raw_max_conf=None):
-        """Append a detection record (JSONL) with timestamp relative to record start."""
+    def _log_follow_change(self, locked_id, follow_id):
+        """Log when the effective follow target changes.
+
+        Operator locks/clears are already logged by FollowTargetState; this
+        covers AUTO picks, losing everyone, and the locked-target-not-visible
+        fallback (where the largest person is followed instead).
+        """
+        if follow_id is None:
+            state = ("none", None)
+        elif locked_id is None:
+            state = ("auto", follow_id)
+        elif follow_id == locked_id:
+            state = ("locked", follow_id)
+        else:
+            state = ("fallback", follow_id)
+        if state == self._last_follow:
+            return
+        prev, self._last_follow = self._last_follow, state
+        mode, fid = state
+        if mode == "auto":
+            LOGGER.info("[FOLLOW] AUTO selected ID %s (largest in view)", fid)
+        elif mode == "fallback":
+            LOGGER.warning("[FOLLOW] locked ID %s not visible -- following largest ID %s instead",
+                           locked_id, fid)
+        elif mode == "locked" and prev is not None and prev[0] == "fallback":
+            LOGGER.info("[FOLLOW] locked ID %s back in view", fid)
+        elif mode == "none" and prev is not None:
+            LOGGER.info("[FOLLOW] no target in view")
+
+    def _write_detection_log(self, detections, following_id, raw_count=None, raw_max_conf=None,
+                             target_id=None):
+        """Append a detection record (JSONL) with timestamp relative to record start.
+
+        ``following_id`` is the operator-locked id (None in AUTO); ``target_id``
+        is the id actually being followed this frame (AUTO pick included).
+        """
         import json as _json
         if self._det_log is None:
             log_path = self._record_path.rsplit(".", 1)[0] + ".jsonl"
@@ -390,7 +425,8 @@ class Hailo15PipelineApp:
             self._det_log_t0 = time.monotonic()
             LOGGER.info("[h15] Detection log: %s", log_path)
         t_rel = time.monotonic() - self._det_log_t0
-        rec = {"t": round(t_rel, 4), "following_id": following_id, "detections": detections}
+        rec = {"t": round(t_rel, 4), "following_id": following_id, "target_id": target_id,
+               "detections": detections}
         if raw_count is not None:
             rec["raw_count"] = raw_count  # how many NMS detections before tracker
         if raw_max_conf is not None:
@@ -729,12 +765,14 @@ class Hailo15PipelineApp:
         # Pick the detection to follow: selected target > largest
         target_id = self.target_state.get_target() if self.target_state else None
         if target_id is not None and target_id in track_by_id:
-            follow_det = track_by_id[target_id]
+            follow_id = target_id
         elif track_by_id:
-            follow_det = max(track_by_id.values(),
-                             key=lambda d: d.bbox_height * d.confidence)
+            follow_id = max(track_by_id,
+                            key=lambda i: track_by_id[i].bbox_height * track_by_id[i].confidence)
         else:
-            follow_det = None
+            follow_id = None
+        follow_det = track_by_id[follow_id] if follow_id is not None else None
+        self._log_follow_change(target_id, follow_id)
 
         self.shared_state.update(follow_det, available_ids=tracked_ids)
 
@@ -767,6 +805,7 @@ class Hailo15PipelineApp:
                 self.target_state.get_target() if self.target_state else None,
                 raw_count=len(all_detections),
                 raw_max_conf=raw_max_conf,
+                target_id=follow_id,
             )
 
         if self._frame_count % 30 == 0:

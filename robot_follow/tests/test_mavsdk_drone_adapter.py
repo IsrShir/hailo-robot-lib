@@ -616,3 +616,131 @@ class TestMavsdkDroneAdapterIntegration:
         from robot_follow.robot_api.robot import Robot
         adapter = _build_adapter()
         assert isinstance(adapter, Robot)
+
+
+# ---------------------------------------------------------------------------
+# TestCommandLogging — [CMD] lines (--log-commands, default on)
+# ---------------------------------------------------------------------------
+
+
+class TestCommandLogging:
+    """``--log-commands`` is on by default and logs setpoints, skips and FC events."""
+
+    @staticmethod
+    def _cmd_lines(caplog) -> list:
+        return [r.getMessage() for r in caplog.records if r.getMessage().startswith("[CMD]")]
+
+    def test_flag_defaults_on_and_can_be_disabled(self) -> None:
+        import argparse
+
+        from robot_follow.robot_api.adapters.mavsdk_drone import add_drone_args
+
+        parser = argparse.ArgumentParser()
+        add_drone_args(parser)
+        assert parser.parse_args([]).log_commands is True
+        assert parser.parse_args(["--no-log-commands"]).log_commands is False
+
+    def test_sent_setpoints_are_logged_by_default(self, caplog) -> None:
+        caplog.set_level("INFO")
+        adapter = _build_adapter()
+        asyncio.run(adapter.send_zero())
+        asyncio.run(adapter.on_target_lost(None))
+        lines = self._cmd_lines(caplog)
+        assert lines[0].startswith("[CMD] stop fwd=+0.00")
+        assert lines[1].startswith("[CMD] search ")
+
+    def test_skip_reason_logged_once_per_change(self, caplog) -> None:
+        caplog.set_level("INFO")
+        adapter = _build_adapter()
+        lost_ctx = SafetyContext.lost(last_target_x=0.7)
+        for _ in range(3):
+            asyncio.run(adapter.send_command(RobotCommand(), lost_ctx))
+        assert self._cmd_lines(caplog) == ["[CMD] not sent: target lost"]
+
+    def test_events_logged(self, caplog) -> None:
+        caplog.set_level("INFO")
+        adapter = _build_adapter()
+        adapter._log_event("arm")
+        asyncio.run(adapter.shutdown())
+        assert self._cmd_lines(caplog) == ["[CMD] arm", "[CMD] session stop"]
+
+    def test_disabled_logs_nothing(self, caplog) -> None:
+        caplog.set_level("INFO")
+        adapter = _build_adapter()
+        adapter._log_commands = False
+        asyncio.run(adapter.send_zero())
+        adapter._log_event("arm")
+        assert self._cmd_lines(caplog) == []
+
+
+# ---------------------------------------------------------------------------
+# TestWaitForOffboard — OFFBOARD is only reported when actually seen
+# ---------------------------------------------------------------------------
+
+
+class _FakeTelemetry:
+    """flight_mode() yields *modes*, then ends (or raises *error*)."""
+
+    def __init__(self, modes, error=None):
+        self._modes, self._error = modes, error
+
+    async def flight_mode(self):
+        for m in self._modes:
+            yield m
+        if self._error is not None:
+            raise self._error
+
+    async def velocity_ned(self):
+        return
+        yield
+
+    async def position(self):
+        return
+        yield
+
+
+def _fake_drone(modes, error=None):
+    drone = MockDrone()
+    drone.telemetry = _FakeTelemetry(modes, error)
+    return drone
+
+
+class TestWaitForOffboard:
+    """A dead telemetry stream (mavsdk_server gone) must not count as OFFBOARD."""
+
+    @staticmethod
+    def _wait(drone) -> bool:
+        from robot_follow.robot_api.adapters.mavsdk_drone import _wait_for_offboard_mode
+
+        async def run():
+            return await _wait_for_offboard_mode(drone, asyncio.Event())
+        return asyncio.run(run())
+
+    def test_returns_true_when_offboard_seen(self) -> None:
+        from mavsdk.telemetry import FlightMode
+        assert self._wait(_fake_drone([FlightMode.STABILIZED, FlightMode.OFFBOARD])) is True
+
+    def test_returns_false_when_stream_ends(self) -> None:
+        from mavsdk.telemetry import FlightMode
+        assert self._wait(_fake_drone([FlightMode.STABILIZED])) is False
+
+    def test_returns_false_when_stream_errors(self) -> None:
+        from mavsdk.telemetry import FlightMode
+        drone = _fake_drone([FlightMode.STABILIZED], error=RuntimeError("Socket closed"))
+        assert self._wait(drone) is False
+
+    def test_start_session_does_not_start_control_without_offboard(self, caplog) -> None:
+        from mavsdk.telemetry import FlightMode
+        caplog.set_level("INFO")
+        adapter = _build_adapter()
+        adapter._drone = _fake_drone([FlightMode.STABILIZED])
+
+        async def run():
+            await adapter.start_session()
+            await adapter.shutdown()
+        asyncio.run(run())
+        lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("[CMD]")]
+        assert adapter._offboard_active is False
+        assert adapter._offboard_monitor_task is None
+        assert "[CMD] OFFBOARD never seen (FC telemetry lost) -- control not started" in lines
+        assert not any("control starts" in line for line in lines)
