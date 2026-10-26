@@ -410,12 +410,16 @@ class DetachedMavsdkServer:
 # Offboard mode helpers
 # ---------------------------------------------------------------------------
 
-async def _wait_for_offboard_mode(drone: System, shutdown: asyncio.Event) -> None:
+async def _wait_for_offboard_mode(drone: System, shutdown: asyncio.Event) -> bool:
     """Block until the drone enters OFFBOARD mode, streaming zero setpoints as keep-alive.
 
     In the default (no --takeoff-landing) mode the user switches to OFFBOARD externally (e.g. via
     a GCS).  We stream zero-velocity setpoints so PX4 accepts the transition, and
     wait patiently instead of killing the process.
+
+    Returns True only if OFFBOARD was actually seen. False means shutdown,
+    or the flight-mode telemetry stream ended (e.g. mavsdk_server died) --
+    callers must not treat that as OFFBOARD.
     """
     zero = VelocityBodyYawspeed(0.0, 0.0, 0.0, 0.0)
     setpoint_period = 0.05
@@ -428,14 +432,22 @@ async def _wait_for_offboard_mode(drone: System, shutdown: asyncio.Event) -> Non
                 pass
             await asyncio.sleep(setpoint_period)
 
-    async def _watch_for_offboard():
-        async for mode in drone.telemetry.flight_mode():
-            if shutdown.is_set():
-                return
-            if mode == FlightMode.OFFBOARD:
-                LOGGER.info("[drone] OFFBOARD mode detected.")
-                return
-            LOGGER.info("[drone] Current mode: %s -- waiting for OFFBOARD...", mode.name)
+    async def _watch_for_offboard() -> bool:
+        try:
+            async for mode in drone.telemetry.flight_mode():
+                if shutdown.is_set():
+                    return False
+                if mode == FlightMode.OFFBOARD:
+                    LOGGER.info("[drone] OFFBOARD mode detected.")
+                    return True
+                LOGGER.info("[drone] Current mode: %s -- waiting for OFFBOARD...", mode.name)
+        except Exception as e:
+            if not shutdown.is_set():
+                LOGGER.warning("[drone] Flight-mode telemetry failed while waiting for OFFBOARD: %s", e)
+            return False
+        if not shutdown.is_set():
+            LOGGER.warning("[drone] Flight-mode telemetry ended while waiting for OFFBOARD")
+        return False
 
     setpoint_task = asyncio.create_task(_stream_setpoints())
     watch_task = asyncio.create_task(_watch_for_offboard())
@@ -450,6 +462,7 @@ async def _wait_for_offboard_mode(drone: System, shutdown: asyncio.Event) -> Non
             await _cancel_task(t)
     finally:
         await _cancel_task(setpoint_task)
+    return watch_task in done and watch_task.result()
 
 
 async def _watch_offboard_mode(drone: System, shutdown: asyncio.Event,
@@ -735,8 +748,13 @@ class MavsdkDroneAdapter:
             self._log_event("OFFBOARD start (--auto-offboard)")
             await _start_offboard(self._drone, self._shutdown_event)
         else:
-            await _wait_for_offboard_mode(self._drone, self._shutdown_event)
+            seen = await _wait_for_offboard_mode(self._drone, self._shutdown_event)
             if self._shutdown_event.is_set():
+                return
+            if not seen:
+                # Telemetry died before the pilot switched: never drive the FC.
+                self._offboard_active = False
+                self._log_event("OFFBOARD never seen (FC telemetry lost) -- control not started")
                 return
             self._log_event("OFFBOARD active (switched by pilot) -- control starts")
             self._offboard_monitor_task = asyncio.create_task(
@@ -770,8 +788,12 @@ class MavsdkDroneAdapter:
             # OFFBOARD lost; stop driving the wire until pilot flips back.
             self._offboard_active = False
             self._log_event("OFFBOARD lost -- pilot has control, commands paused")
-            await _wait_for_offboard_mode(self._drone, self._shutdown_event)
+            seen = await _wait_for_offboard_mode(self._drone, self._shutdown_event)
             if self._shutdown_event.is_set():
+                return
+            if not seen:
+                # Telemetry died: stay paused rather than assume OFFBOARD.
+                self._log_event("OFFBOARD not regained (FC telemetry lost) -- commands stay paused")
                 return
             # Re-acquired. Reset smoothing so we don't carry stale state
             # into the new control session.
