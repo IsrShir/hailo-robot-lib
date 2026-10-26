@@ -7,6 +7,7 @@ were deleted in Phase 3 plan 03-07 — MavsdkDroneAdapter (driven by
 robot_api.orchestrator.run_robot_loop) is the sole production path.
 """
 
+import argparse
 import asyncio
 import logging
 import math
@@ -285,9 +286,11 @@ def add_drone_args(parser) -> None:
                             "Default: off — stream zero setpoints and wait for the operator to switch "
                             "to OFFBOARD via the GCS. Manual handshake is the safer choice for real-drone "
                             "flights; auto-offboard is appropriate for SITL / bench tests.")
-    group.add_argument("--log-commands", action="store_true",
-                       help="Log every velocity setpoint sent to the FC ([CMD] lines, one per "
-                            "control tick, ~10/s) plus why commands are skipped. Default: off.")
+    group.add_argument("--log-commands", action=argparse.BooleanOptionalAction, default=True,
+                       help="Log every command sent to the FC as [CMD] lines: velocity setpoints "
+                            "(one per control tick, ~10/s), why a setpoint was skipped, and "
+                            "FC events (connect, arm, takeoff, OFFBOARD start/lost/regained, land). "
+                            "Default: on; --no-log-commands to disable.")
     group.add_argument("--target-altitude", type=float, default=3.0,
                        help="Target altitude in metres (default: 3.0). Also used as takeoff height with --takeoff-landing.")
     group.add_argument("--mission-duration", type=float, default=300.0,
@@ -608,7 +611,7 @@ class MavsdkDroneAdapter:
         # flips this flag; the auto-offboard path leaves it True.
         self._offboard_active: bool = True
         self._offboard_monitor_task: Optional[asyncio.Task] = None
-        self._log_commands: bool = bool(getattr(args, "log_commands", False))
+        self._log_commands: bool = bool(getattr(args, "log_commands", True))
         self._last_skip: Optional[str] = None  # last logged skip reason
 
     def _log_sent(self, kind: str, sent: RobotCommand,
@@ -630,6 +633,13 @@ class MavsdkDroneAdapter:
             return
         self._last_skip = reason
         LOGGER.info("[CMD] not sent: %s", reason)
+
+    def _log_event(self, event: str) -> None:
+        """--log-commands: one [CMD] line per FC action or mode change."""
+        if not self._log_commands:
+            return
+        self._last_skip = None
+        LOGGER.info("[CMD] %s", event)
 
     async def connect(self) -> None:
         """Open MAVSDK gRPC. Raises ConnectionError on timeout.
@@ -664,6 +674,7 @@ class MavsdkDroneAdapter:
                 f"{_CONNECTION_TIMEOUT_S}s. Pipeline continues without drone control."
             )
         self._drone = drone
+        self._log_event(f"connected to FC on {self._args.connection}")
 
     async def start_session(self) -> None:
         """Spawn telemetry tasks, run offboard handshake.
@@ -698,6 +709,7 @@ class MavsdkDroneAdapter:
                 if self._shutdown_event.is_set():
                     return
                 try:
+                    self._log_event("arm")
                     await self._drone.action.arm()
                     break
                 except mavsdk.action.ActionError as e:
@@ -711,6 +723,7 @@ class MavsdkDroneAdapter:
                         if self._shutdown_event.is_set():
                             return
                         await asyncio.sleep(_ARM_SHUTDOWN_POLL_S)
+            self._log_event(f"takeoff to {self._args.target_altitude:.1f} m")
             await self._drone.action.takeoff()
             await asyncio.sleep(5)
         # OFFBOARD handshake. --auto-offboard tells the app to set the
@@ -719,11 +732,13 @@ class MavsdkDroneAdapter:
         # spawn the resilience monitor that pauses send_command if the
         # pilot leaves OFFBOARD mid-flight.
         if getattr(self._args, "auto_offboard", False):
+            self._log_event("OFFBOARD start (--auto-offboard)")
             await _start_offboard(self._drone, self._shutdown_event)
         else:
             await _wait_for_offboard_mode(self._drone, self._shutdown_event)
             if self._shutdown_event.is_set():
                 return
+            self._log_event("OFFBOARD active (switched by pilot) -- control starts")
             self._offboard_monitor_task = asyncio.create_task(
                 self._offboard_resilience_loop())
 
@@ -754,6 +769,7 @@ class MavsdkDroneAdapter:
                 return
             # OFFBOARD lost; stop driving the wire until pilot flips back.
             self._offboard_active = False
+            self._log_event("OFFBOARD lost -- pilot has control, commands paused")
             await _wait_for_offboard_mode(self._drone, self._shutdown_event)
             if self._shutdown_event.is_set():
                 return
@@ -761,6 +777,7 @@ class MavsdkDroneAdapter:
             # into the new control session.
             self._smoothing = SmoothingState()
             self._offboard_active = True
+            self._log_event("OFFBOARD regained -- control resumes")
 
     async def send_command(
         self,
@@ -841,6 +858,7 @@ class MavsdkDroneAdapter:
             getattr(self._args, "takeoff_landing", False)
             and self._drone is not None
         ):
+            self._log_event("OFFBOARD stop + land")
             try:
                 await _land_safely(self._drone)
             except Exception:
@@ -850,6 +868,8 @@ class MavsdkDroneAdapter:
                 self._mavsdk_server_cm.__exit__(None, None, None)
             except Exception:
                 pass
+        if self._drone is not None:
+            self._log_event("session stop")
         self._drone = None
         self._mavsdk_server_cm = None
 
