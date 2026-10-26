@@ -54,6 +54,7 @@ def _ensure_protobuf_runtime_version() -> None:
 
 _ensure_protobuf_runtime_version()
 
+from robot_follow.follow_api.event_log import FollowCause, log_follow_change  # noqa: E402
 from robot_follow.follow_api.state import SharedDetectionState, FollowTargetState  # noqa: E402
 from robot_follow.follow_api.types import Detection  # noqa: E402
 from robot_follow.native_pipeline.protos import analytics_metadata_pb2 as _pb  # noqa: E402
@@ -62,6 +63,10 @@ LOGGER = logging.getLogger(__name__)
 
 PERSON_LABEL = "person"
 DETECTION_CONFIDENCE_THRESHOLD = 0.4
+# How long an AUTO-picked person may be missing before AUTO picks again.
+# Shorter than this the drone holds, so a one-frame tracker dropout
+# doesn't switch to someone else.
+AUTO_TARGET_RELEASE_S = 1.0
 
 
 class NativePipelineSubscriber:
@@ -96,9 +101,16 @@ class NativePipelineSubscriber:
         ui_state=None,
         record_path: Optional[str] = None,
         tiles: Optional[list] = None,
+        controller_config=None,
     ) -> None:
         self._shared_state = shared_state
         self._target_state = target_state
+        # Read live each frame for ``auto_select`` (the web UI toggle
+        # mutates this same object via POST /api/config).
+        self._controller_config = controller_config
+        # Track ID that AUTO mode picked (None when the current target was
+        # clicked by the operator, or there is no target).
+        self._auto_target_id: Optional[int] = None
         self._ui_state = ui_state
         self._byte_tracker = byte_tracker
         self._zmq_endpoint = zmq_endpoint
@@ -198,6 +210,72 @@ class NativePipelineSubscriber:
     # ------------------------------------------------------------------ #
     # Internal
     # ------------------------------------------------------------------ #
+    def _select_follow(self, track_by_id: dict) -> tuple[Optional[Detection], Optional[int]]:
+        """Pick the detection to follow and the ID to show as followed.
+
+        Mirrors the RPi AUTO semantics (hailo_drone_detection_manager):
+
+        - Operator-clicked target present → follow it.
+        - No target, auto-select ON → lock onto the biggest person
+          (``bbox_height × confidence``) by writing its ID to target_state,
+          so the UI highlights it and the choice sticks across frames
+          instead of being re-picked every frame.
+        - AUTO target missing for longer than ``AUTO_TARGET_RELEASE_S`` →
+          release it and pick again; within the grace window, hold (no
+          detection) so a one-frame dropout doesn't switch people.
+        - No target, auto-select OFF (or paused) → follow nothing; the
+          drone holds until the operator clicks someone.
+        - Operator-clicked target missing → unchanged legacy behavior:
+          follow the biggest person this frame but keep the clicked ID, so
+          the lock resumes when that track comes back.
+
+        Returns ``(follow_det, following_id)``; ``following_id`` is what the
+        UI and the detection log show as the followed person.
+        """
+        ts = self._target_state
+        if ts is None:
+            # No target state wired (tests / headless): legacy biggest-person.
+            if not track_by_id:
+                return None, None
+            tid = max(track_by_id, key=lambda i: _follow_score(track_by_id[i]))
+            return track_by_id[tid], None
+
+        target_id = ts.get_target()
+        if target_id is not None and target_id != self._auto_target_id:
+            self._auto_target_id = None  # operator took over
+
+        if target_id is not None and target_id in track_by_id:
+            ts.update_last_seen()
+            return track_by_id[target_id], target_id
+
+        if target_id is not None and target_id == self._auto_target_id:
+            last_seen = ts.get_last_seen()
+            if last_seen is not None and time.monotonic() - last_seen < AUTO_TARGET_RELEASE_S:
+                return None, target_id  # brief dropout — hold, keep showing the lock
+            LOGGER.info("[AUTO] Target ID %s lost — picking again", target_id)
+            ts.enter_auto_mode()
+            log_follow_change(target_id, None, cause=FollowCause.AUTO)
+            self._auto_target_id = None
+            target_id = None
+
+        if target_id is not None:
+            # Operator-clicked target not visible this frame (legacy fallback).
+            if not track_by_id:
+                return None, target_id
+            tid = max(track_by_id, key=lambda i: _follow_score(track_by_id[i]))
+            return track_by_id[tid], target_id
+
+        auto_select = bool(getattr(self._controller_config, "auto_select", True))
+        if not auto_select or ts.is_paused() or not track_by_id:
+            return None, None
+
+        tid = max(track_by_id, key=lambda i: _follow_score(track_by_id[i]))
+        ts.set_target(tid)
+        self._auto_target_id = tid
+        log_follow_change(None, tid, cause=FollowCause.AUTO)
+        LOGGER.info("[AUTO] Following biggest person ID %s", tid)
+        return track_by_id[tid], tid
+
     def _run(self) -> None:
         ctx = zmq.Context.instance()
         sock = ctx.socket(zmq.SUB)
@@ -236,23 +314,10 @@ class NativePipelineSubscriber:
             ui_dets = [_detection_to_ui_dict(d, i) for i, d in enumerate(detections)]
         tracked_ids = set(track_by_id.keys())
 
-        # Select the followed detection: target_state's pick if available,
-        # else largest area × confidence. Matches the legacy semantics in
-        # hailo15_pipeline.py:730-737.
-        target_id = self._target_state.get_target() if self._target_state else None
-        if target_id is not None and target_id in track_by_id:
-            follow_det = track_by_id[target_id]
-        elif track_by_id:
-            follow_det = max(
-                track_by_id.values(),
-                key=lambda d: d.bbox_height * d.confidence,
-            )
-        else:
-            follow_det = None
+        follow_det, following_id = self._select_follow(track_by_id)
 
         self._shared_state.update(follow_det, available_ids=tracked_ids)
-        self._write_det_log(ui_dets, target_id=(
-            self._target_state.get_target() if self._target_state else None))
+        self._write_det_log(ui_dets, target_id=following_id)
 
         # Per-frame stats for tiling verification. We attribute each
         # detection to the smallest active tile (self._tiles) it fully
@@ -262,9 +327,6 @@ class NativePipelineSubscriber:
         stats = _compute_tile_stats(ui_dets, self._tiles)
 
         if self._ui_state is not None:
-            following_id = (
-                self._target_state.get_target() if self._target_state else None
-            )
             # commit=True advances _frame_seq so the SSE handler wakes up.
             # Without it the UI never sees new detections because its SSE
             # stream blocks on the seq counter (designed around the Python
@@ -289,6 +351,11 @@ class NativePipelineSubscriber:
 # ---------------------------------------------------------------------- #
 # Pure helpers — no I/O, no instance state. Easier to unit-test.
 # ---------------------------------------------------------------------- #
+
+def _follow_score(det: Detection) -> float:
+    """AUTO ranking: biggest, most confident person (legacy H15 metric)."""
+    return det.bbox_height * det.confidence
+
 
 def _normalize_person_detections(frame) -> list[Detection]:
     """Convert protobuf Detection (pixel coords, multi-class) to the
