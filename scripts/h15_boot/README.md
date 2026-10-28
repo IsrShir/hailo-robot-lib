@@ -2,6 +2,9 @@
 
 Reference for running `drone_follow_h15` on the Hailo15 target.
 
+To flash a board and install everything (any image, on the shuttle or from a laptop), use the
+`h15-vpu-setup` skill: `.claude/skills/h15-vpu-setup/SKILL.md`; background in `VPU_SETUP_NOTES.md`.
+
 ## Files on the H15 (after `install.sh`)
 
 | File | Purpose |
