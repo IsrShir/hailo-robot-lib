@@ -12,6 +12,7 @@ Sub-project knowledge lives under `.claude/`:
 - `.claude/skills/drone-follow-dev/SKILL.md` — sim + drone-follow run loop, port hygiene, kill recipes.
 - `.claude/skills/safe-pull-and-rollback/SKILL.md` — tag-before-pull / compare / roll back / cross-machine tag share.
 - `.claude/skills/h15-board-setup/SKILL.md` — bring up a Hailo-15 board for `drone_follow_h15`: phys-ai image, u-boot TFTP flash, sensor, `scripts/h15_boot/install.sh` + `check_board.sh`, first run, SITL.
+- `.claude/skills/h15-vpu-setup/SKILL.md` — run `drone_follow_h15 --native-pipeline` on a **formal VPU release** (e.g. `vpu-stability-v1.13.0`): from the shuttle, stage + flash over the u-boot console (Board Init), build/install the runtime bundle, install the app, `--dry-run` smoke test.
 
 Repo-wide knowledge (not drone-follow-specific) is in `.hailo/memory/` at the repo root — pipeline patterns, common pitfalls, etc.
 

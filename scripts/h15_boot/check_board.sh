@@ -20,18 +20,25 @@ echo "[image]"
 if [ -f /etc/build-info ]; then
     ok "build: $(grep -E '^(BUILD_TIME|DISTRO_VERSION)' /etc/build-info | tr '\n' ' ')"
 fi
-command -v mavsdk_server >/dev/null && ok "mavsdk_server: $(command -v mavsdk_server)" \
-    || bad "mavsdk_server missing (image not built with the phys-ai kas config)"
+if [ -f /usr/share/drone-follow/bundle-manifest.txt ]; then
+    ok "formal image + drone-follow bundle: $(sed -n 's/^release=//p' /usr/share/drone-follow/bundle-manifest.txt), built $(sed -n 's/^built=//p' /usr/share/drone-follow/bundle-manifest.txt)"
+fi
+# mavsdk_server: on PATH in the phys-ai image, inside the mavsdk package with the bundle.
+SRV=$(command -v mavsdk_server || python3 -c 'import mavsdk, os; print(os.path.join(os.path.dirname(mavsdk.__file__), "bin", "mavsdk_server"))' 2>/dev/null)
+[ -n "$SRV" ] && [ -x "$SRV" ] && ok "mavsdk_server: $SRV" \
+    || bad "mavsdk_server missing (phys-ai image, or install_bundle.sh on a formal image)"
 # The image's python3-protobuf (3.x) lacks runtime_version, which python3-mavsdk's
 # generated code imports; drone_follow_h15.py stubs it at startup. Check the same way.
 python3 -c "
 import types, google.protobuf as pb
 rv = types.ModuleType('runtime_version'); rv.ValidateProtobufRuntimeVersion = lambda *a, **k: None
 rv.Domain = type('Domain', (), {'PUBLIC': 1})(); pb.runtime_version = rv
-import mavsdk" 2>/dev/null && ok "python: mavsdk" || bad "python: mavsdk missing (image not built with the phys-ai kas config?)"
-for m in pymavlink hailo_platform gi numpy google.protobuf; do
-    pyimp "$m" && ok "python: $m" || bad "python: $m missing (image not built with the phys-ai kas config?)"
+import mavsdk" 2>/dev/null && ok "python: mavsdk" || bad "python: mavsdk missing (phys-ai image, or install_bundle.sh on a formal image)"
+for m in hailo_platform gi numpy google.protobuf; do
+    pyimp "$m" && ok "python: $m" || bad "python: $m missing (phys-ai image, or install_bundle.sh on a formal image)"
 done
+# The app doesn't import pymavlink; only some tools do.
+pyimp pymavlink && ok "python: pymavlink" || warn "python: pymavlink missing (not needed by the app)"
 pyimp zmq && ok "python: zmq $(python3 -c 'import zmq; print(zmq.__version__)')" \
     || bad "python: zmq missing (needed for --native-pipeline; run install_pyzmq.sh)"
 
