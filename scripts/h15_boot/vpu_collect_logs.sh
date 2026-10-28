@@ -13,7 +13,8 @@
 #                 host. Omit in local mode (they're read from this host's $HOME).
 #
 # Saves (missing files are skipped and listed in MISSING.txt):
-#   board/   df_live.log, df_smoke.log (app), hailo_analytics.log, medialib.log,
+#   board/   drone-follow.log (service / [CMD] log, tmpfs: lost on reboot),
+#            df_live.log, df_smoke.log (app), hailo_analytics.log, medialib.log,
 #            dmesg.txt, build-info, os-release, bundle-manifest.txt, check_board.txt
 #   shuttle/ h15_flash.out (flash summary), h15_console.log (full serial console)
 # Step outputs the skill tee'd into the run dir (e.g. 2_stage.log) stay as they are.
@@ -39,7 +40,7 @@ echo "===== Collecting logs into $RUN_DIR ====="
 
 # --- board -------------------------------------------------------------------------
 if target_ssh true 2>/dev/null; then
-    for f in /tmp/df_live.log /tmp/df_smoke.log /home/root/hailo_analytics.log /home/root/medialib.log \
+    for f in /var/log/drone-follow.log /tmp/df_live.log /tmp/df_smoke.log /home/root/hailo_analytics.log /home/root/medialib.log \
              /etc/build-info /etc/os-release /usr/share/drone-follow/bundle-manifest.txt; do
         if target_ssh "cat $f" > "$RUN_DIR/board/$(basename "$f")" 2>/dev/null; then
             echo "  ok   board:$f"

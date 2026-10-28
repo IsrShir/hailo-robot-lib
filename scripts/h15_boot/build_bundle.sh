@@ -1,21 +1,27 @@
 #!/bin/bash
-# Build the runtime bundle that lets a formal VPU release image run drone-follow.
+# Build the runtime bundle that lets an H15 image run drone-follow.
 #
 # A formal release image (e.g. vpu-stability-v1.13.0) is built without the
 # phys-ai packagegroup, so it lacks numpy, pyhailort, mavsdk (+ mavsdk_server),
-# grpcio, protobuf and pyzmq. Its HailoRT / media library versions also differ
-# from the ones df_native_pipeline was last built against. This script builds
-# all of that on the build host, from the release's own SDK, into one tarball
-# that install_bundle.sh unpacks on the board. Nothing here touches a board.
+# grpcio, protobuf and pyzmq; a phys-ai dev image has those but no pyzmq. Either
+# way df_native_pipeline must be built against the image's own media library.
+# This script builds all of that on the build host, from the image's SDK, into
+# one tarball. install_bundle.sh unpacks on the board only the packages the
+# image lacks. Nothing here touches a board.
 #
 # Usage:
 #   ./build_bundle.sh --release vpu-stability-v1.13.0 --machine hailo15l-sbc
+#   ./build_bundle.sh --release ref-phys-ai-20260601 --machine hailo15l-sbc \
+#       --sdk-from hailo@10.41.75.21:/local/users/sdk/poky-glibc-x86_64-core-image-hailo-dev-armv8a-hailo15l-sbc-toolchain-4.0.23.sh
 #
 # Options:
-#   --release NAME     VPU release folder on ystor (required)
+#   --release NAME     VPU release folder on ystor; with --sdk-from / --sdk-dir only a label
+#                      for the output folder and the manifest (required)
 #   --machine NAME     hailo15l-sbc | hailo15-sbc | hailo15-sbc-rev3-1 (required)
 #   --work DIR         Work dir for SDK, sources, wheels (default $H15_WORK, else ~/h15_bundle_work)
 #   --sdk-dir DIR      Use an already-installed SDK instead of fetching one
+#   --sdk-from SRC     Fetch the SDK installer (.sh) from SRC ([user@host:]path) instead of
+#                      ystor, e.g. for a dev image whose SDK isn't on ystor
 #   --native-ref REF   Git ref holding robot_follow/native_pipeline (default HEAD,
 #                      so the binary matches the app code install_app.sh syncs)
 #   --ystor HOST       Release store (default hailo@192.168.12.21)
@@ -33,6 +39,7 @@ RELEASE=""
 MACHINE=""
 WORK="${H15_WORK:-${HOME}/h15_bundle_work}"
 SDK_DIR=""
+SDK_FROM=""
 NATIVE_REF="HEAD"
 YSTOR="${YSTOR:-hailo@192.168.12.21}"
 YSTOR_BKC="/mnt/ystor/bkc"
@@ -43,9 +50,10 @@ while [ $# -gt 0 ]; do
         --machine)    MACHINE="$2"; shift 2 ;;
         --work)       WORK="$2"; shift 2 ;;
         --sdk-dir)    SDK_DIR="$2"; shift 2 ;;
+        --sdk-from)   SDK_FROM="$2"; shift 2 ;;
         --native-ref) NATIVE_REF="$2"; shift 2 ;;
         --ystor)      YSTOR="$2"; shift 2 ;;
-        -h|--help)    sed -n '2,32p' "$0"; exit 0 ;;
+        -h|--help)    sed -n '2,38p' "$0"; exit 0 ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -78,7 +86,14 @@ echo "===== Building drone-follow bundle: $RELEASE / $MACHINE ====="
 # --- 1. SDK -------------------------------------------------------------------
 if [ -z "$SDK_DIR" ]; then
     SDK_DIR="${OUT}/sdk"
-    if [ ! -f "${SDK_DIR}/environment-setup-armv8a-poky-linux" ]; then
+    if [ ! -f "${SDK_DIR}/environment-setup-armv8a-poky-linux" ] && [ -n "$SDK_FROM" ]; then
+        SDK_NAME=$(basename "${SDK_FROM#*:}")
+        echo "[1/6] Fetching SDK $SDK_NAME from ${SDK_FROM%%:*} (~3 GB)..."
+        if [ "$SDK_FROM" != "${SDK_FROM#*:}" ]; then scp -q "$SDK_FROM" "${OUT}/${SDK_NAME}"; else cp "$SDK_FROM" "${OUT}/${SDK_NAME}"; fi
+        echo "      Installing SDK into $SDK_DIR..."
+        sh "${OUT}/${SDK_NAME}" -y -d "$SDK_DIR" >/dev/null
+        rm -f "${OUT}/${SDK_NAME}"
+    elif [ ! -f "${SDK_DIR}/environment-setup-armv8a-poky-linux" ]; then
         SDK_REMOTE_DIR="${YSTOR_BKC}/${RELEASE}/hailo-yocto-validation/build/tmp/deploy/sdk"
         SDK_NAME=$(echo "ls ${SDK_REMOTE_DIR}" | ystor | grep -E "^poky-glibc-x86_64-core-image-hailo-dev-armv8a-${MACHINE}-toolchain-.*\.sh$" | head -1)
         [ -n "$SDK_NAME" ] || { echo "ERROR: no SDK for $MACHINE in $SDK_REMOTE_DIR" >&2; exit 1; }
@@ -100,7 +115,10 @@ set +u
 . "${SDK_DIR}/environment-setup-armv8a-poky-linux" >/dev/null
 set -u
 SYSROOT="$SDKTARGETSYSROOT"
-NATIVE_PY=$(ls "${OECORE_NATIVE_SYSROOT}"/usr/bin/python3.[0-9]* | grep -E 'python3\.[0-9]+$' | head -1)
+NATIVE_PY=""
+for p in "${OECORE_NATIVE_SYSROOT}"/usr/bin/python3.[0-9]*; do
+    [[ "$p" =~ python3\.[0-9]+$ ]] && { NATIVE_PY="$p"; break; }
+done
 TOOLCHAIN_CMAKE="${OECORE_NATIVE_SYSROOT}/usr/share/cmake/OEToolchainConfig.cmake"
 
 # Versions come from the SDK sysroot, i.e. from the release itself.
@@ -140,11 +158,12 @@ if [ -f "${PYH_DIR}/pyproject.toml" ]; then
 (
     cd "$PYH_DIR"
     export CXXFLAGS="${CXXFLAGS:-} -isystem ${SYSROOT}/usr/include/python${PY_VER}"
+    PYBIND11_DIR=$("${HOSTVENV}/bin/python" -m pybind11 --cmakedir)
     export CMAKE_ARGS="-DCMAKE_TOOLCHAIN_FILE=${TOOLCHAIN_CMAKE} \
         -DLIBHAILORT_PATH=${SYSROOT}/usr/lib/libhailort.so \
         -DHAILORT_INCLUDE_DIR=${SYSROOT}/usr/include \
         -DPYBIND11_PYTHON_VERSION=${PY_VER} \
-        -Dpybind11_DIR=$("${HOSTVENV}/bin/python" -m pybind11 --cmakedir) \
+        -Dpybind11_DIR=${PYBIND11_DIR} \
         -DPYTHON_EXECUTABLE=${NATIVE_PY} \
         -DPYTHON_INCLUDE_DIR=${SYSROOT}/usr/include/python${PY_VER} \
         -DPYTHON_LIBRARY=${SYSROOT}/usr/lib/libpython${PY_VER}.so"
@@ -227,8 +246,19 @@ MANIFEST="${STAGE}/usr/share/drone-follow/bundle-manifest.txt"
     echo "native_ref=$NATIVE_REF@$NATIVE_COMMIT"
     for w in "$WHEELS"/*.whl; do echo "wheel=$(basename "$w")"; done
 } > "$MANIFEST"
-# Top-level site-packages entries, so install_bundle.sh can remove a previous bundle cleanly.
-ls "$SITE" | sed "s|^|site=|" >> "$MANIFEST"
+# One line per package: "pkg=<name> <import module> <its top-level site-packages entries>".
+# install_bundle.sh skips a package whose module the image already imports (phys-ai images
+# ship numpy, mavsdk, grpcio, protobuf, pyhailort) and records what it actually installed.
+declare -A IMPORT_OF=([numpy]=numpy [grpcio]=grpc [protobuf]=google.protobuf [mavsdk]=mavsdk
+    [aiogrpc]=aiogrpc [pyzmq]=zmq [six]=six [typing_extensions]=typing_extensions [hailort]=hailo_platform)
+for w in "$WHEELS"/*.whl; do
+    name=$(basename "$w" | cut -d- -f1 | tr '[:upper:]' '[:lower:]')
+    mod=${IMPORT_OF[$name]:-$name}
+    entries=$(unzip -Z1 "$w" | cut -d/ -f1 | sort -u | while read -r e; do
+        if [ -e "${SITE}/$e" ]; then echo "$e"; fi   # not `&& echo`: under set -e/pipefail a false test ends the script
+    done | paste -sd, -)
+    echo "pkg=$name $mod $entries"
+done >> "$MANIFEST"
 
 BUNDLE="${OUT}/drone-follow-bundle-${RELEASE}-${MACHINE}.tar.gz"
 tar czf "$BUNDLE" --owner=0 --group=0 -C "$STAGE" .

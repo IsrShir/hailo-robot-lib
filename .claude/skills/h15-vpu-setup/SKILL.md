@@ -1,11 +1,16 @@
 ---
 name: h15-vpu-setup
-description: Put a formal Hailo VPU release (e.g. vpu-stability-v1.13.0) on the Hailo-15 board wired to a test shuttle (run on the shuttle, or remotely from a laptop over ssh) and make drone_follow_h15 --native-pipeline run on it - stage the release for TFTP, flash it from the u-boot console, build and install the runtime bundle (numpy, pyzmq, mavsdk, pyhailort, native binary), install the app, smoke-test with --dry-run. Use when the user says "set up drone follow on vpu-stability-vX.Y.Z", "flash <release> on the shuttle's board and run robot follow", or "does drone follow work on the new VPU release".
+description: Put an H15 image (a formal Hailo VPU release such as vpu-stability-v1.13.0, or a phys-ai dev build / image folder) on the Hailo-15 board wired to a test shuttle (run on the shuttle, or remotely from a laptop over ssh) and make drone_follow_h15 --native-pipeline run on it - stage the image for TFTP, flash it from the u-boot console, build and install the runtime bundle (only what the image lacks - numpy, pyzmq, mavsdk, pyhailort, native binary), install the app, smoke-test with --dry-run. Use when the user says "set up drone follow on vpu-stability-vX.Y.Z", "flash <release> on the shuttle's board and run robot follow", "does drone follow work on the new VPU release", "set up a new H15 for drone follow", "flash the H15 / reproduce the board", or "why doesn't drone follow run on this H15".
 ---
 
-# Drone-follow on a formal VPU release (H15L / H15H)
+# Drone-follow on an H15 image (formal VPU release or phys-ai dev build; H15L / H15H)
 
-Arguments: **release** (folder under `ystor:/mnt/ystor/bkc/`, e.g. `vpu-stability-v1.13.0`),
+Arguments: **image**, one of
+- a **release**: folder under `ystor:/mnt/ystor/bkc/`, e.g. `vpu-stability-v1.13.0` (formal VPU release), or
+- an **image folder** `[user@host:]path` holding the Board Init files, e.g. a phys-ai dev build or a board backup
+  (`hailo@10.41.75.21:/local/users/h15l_reference_backup/image_files`), plus where its SDK installer is
+  (step 4; formal releases have theirs on ystor);
+
 **shuttle** (`hailo@<ip>`, or `local` when Claude runs on the shuttle), optionally **board**
 (`hailo15l-sbc`, `hailo15-sbc`, `hailo15-sbc-rev3-1`; detected if omitted) and **logs**
 (`yes` by default: keep every step's output and the board/shuttle logs, see "Run logs" below; `no` to skip).
@@ -41,10 +46,11 @@ Never source `shuttle.env` on the laptop: it points `H15_WORK` / `H15_IMAGES` at
 and `build_bundle.sh` fails with `mkdir: cannot create directory '/local'`. On the laptop the bundle goes
 to `~/h15_bundle_work` (step 4's default).
 
-Why a formal release needs more than flashing: it has no phys-ai packagegroup, so numpy, pyzmq,
-mavsdk + mavsdk_server, grpcio, protobuf and pyhailort are missing, and its HailoRT / media library
-differ from what `df_native_pipeline` was built against. `build_bundle.sh` builds all of that from the
-release's own SDK into one tarball, and `install_bundle.sh` unpacks it on the board (new paths only).
+Why an image needs more than flashing: `df_native_pipeline` must be built against the image's own media
+library, and no image has pyzmq. A formal release also lacks the phys-ai packagegroup (numpy, mavsdk +
+mavsdk_server, grpcio, protobuf, pyhailort); a phys-ai dev build has those. `build_bundle.sh` builds all of
+it from the image's SDK into one tarball; `install_bundle.sh` installs on the board **only the packages the
+image lacks** (so a phys-ai image keeps its own mavsdk, numpy, pyhailort) plus the native binary.
 
 ## What needs a person
 
@@ -108,7 +114,8 @@ every `vpu_live.sh stop`, collect the rest from the board and shuttle (board `/t
 scripts/h15_boot/vpu_collect_logs.sh --run-dir "$RUN" --target "$TARGET"                      # local mode
 scripts/h15_boot/vpu_collect_logs.sh --run-dir "$RUN" --target h15-<short> --shuttle hailo@<ip>   # remote mode
 ```
-It saves `board/` (app logs `df_live.log` / `df_smoke.log`, `hailo_analytics.log`, `medialib.log`, `dmesg.txt`,
+It saves `board/` (`drone-follow.log`: the service's log with the `[CMD]` FC lines, in RAM, so lost on reboot;
+app logs `df_live.log` / `df_smoke.log`, `hailo_analytics.log`, `medialib.log`, `dmesg.txt`,
 `build-info`, `os-release`, `bundle-manifest.txt`, `check_board.txt`) and `shuttle/` (`h15_flash.out`,
 `h15_console.log`, the full serial console). Re-running it refreshes the same directory. Board timestamps
 read 2018 (no RTC): use them as relative times. App log lines appear twice (two handlers); harmless.
@@ -122,17 +129,22 @@ scripts/h15_boot/vpu_detect.sh
 # remote mode: on_shuttle "EXTRA_PUBKEYS='$(cat ~/.ssh/id_ed25519.pub)' scripts/h15_boot/vpu_board_key.sh && scripts/h15_boot/vpu_detect.sh"
 ```
 - `BOARD_STATE=linux`: use `MACHINE` as the board (if the user also gave one and they differ, stop and ask).
-  If `RELEASE` already equals the requested release, **skip to step 4**.
+  If the board already runs the requested image, **skip to step 4**: for a release, `RELEASE` equals it; for an
+  image folder, `IMAGE_NAME` matches the folder's `core-image-hailo-dev-<machine>.uid` / build (dev builds set
+  `RELEASE=develop`, so compare the image, not the name).
 - `no-ssh` / `down`: `scripts/h15_boot/vpu_console.py detect --reset manual` → `BOARD=` is the machine.
 
-## 2. Stage the release for TFTP
+## 2. Stage the image for TFTP
 
 ```bash
 scripts/h15_boot/vpu_stage.sh --release <release> --machine <machine>
+scripts/h15_boot/vpu_stage.sh --image-dir [user@host:]<folder> --machine <machine> [--name <label>]   # image folder
 ```
-Copies the 13 Board Init files from ystor to `$H15_IMAGES/<release>/<machine>/` (md5-checked,
-re-runs skip good files), points `/srv/tftp` there and restarts `tftpd-hpa`. Note the printed `revert:`
-line for the report. Missing files → the release wasn't built for that machine: stop and tell the user.
+Copies the 13 Board Init files from ystor (or the folder; read access is enough) to
+`$H15_IMAGES/<release-or-label>/<machine>/` (md5-checked against the source, re-runs skip good files),
+points `/srv/tftp` there and restarts `tftpd-hpa`. Note the printed `revert:` line for the report. Missing
+files → the image wasn't built for that machine: stop and tell the user. The source must be reachable from
+the shuttle; if it isn't, copy the folder to the shuttle first and pass the local path.
 
 ## 3. Flash
 
@@ -198,7 +210,11 @@ Never use `run update_partitions_mmc1` / `update_rootfs` for these releases: u-b
 ```bash
 B=${H15_WORK:-$HOME/h15_bundle_work}/<release>/<machine>/drone-follow-bundle-<release>-<machine>.tar.gz
 [ -f "$B" ] || scripts/h15_boot/build_bundle.sh --release <release> --machine <machine>
+# image folder: <release> is just a label; give the image's SDK installer (or an installed SDK with --sdk-dir), e.g.
+#   --sdk-from hailo@10.41.75.21:/local/users/sdk/poky-glibc-x86_64-core-image-hailo-dev-armv8a-hailo15l-sbc-toolchain-4.0.23.sh
 ```
+The SDK must be the one the image was built with: `install_bundle.sh` refuses a board whose libhailort
+differs from the SDK's. If the user doesn't know where an image's SDK is, ask; don't guess.
 First run per release/machine fetches and installs the SDK (~3 GB, several minutes), builds pyhailort
 from the public `hailort` tag matching the SDK's libhailort, builds `df_native_pipeline` from `HEAD`,
 and downloads cp3X aarch64 wheels. Rebuild (delete the tarball) when the app's native code changes.
@@ -214,14 +230,15 @@ Time: SDK fetch + install ~10-20 min on first use per release/machine, then ~3 m
 scripts/h15_boot/install_bundle.sh "$B" "$TARGET" --reboot     # preflight, unpack, setup_hailo_sensor.sh, verify
 # --reboot returns only after the board went down AND came back (don't add your own ssh wait:
 # ssh answers for a few seconds after `reboot`, so a plain loop runs the next step on the old system)
-scripts/h15_boot/build_ui.sh                                   # needs npm
-scripts/h15_boot/install_app.sh "$TARGET"
-scripts/h15_boot/check_board.sh "$TARGET"                      # every FAIL must be fixed; FC/service WARNs are fine
+SKIP_SERVICE=1 scripts/h15_boot/install.sh "$TARGET"           # UI build (npm), app, check_board.sh
 ```
 `install_bundle.sh` preflight refuses a board whose libhailort differs from the bundle's SDK (wrong
-release on the board), so nothing is half-installed. Don't run `install.sh` or `install_pyzmq.sh` /
-`install_native.sh` on a formal image: the bundle already provides those, from the right SDK.
-Don't install the boot service unless the user asks: it holds the camera and would block step 6.
+image on the board), so nothing is half-installed. It prints `skip` / `install` per package: on a formal
+release everything installs; on a phys-ai image only pyzmq (and the native binary) should. It records what it
+installed in `/usr/share/drone-follow/bundle-installed.txt`; a later bundle removes only those.
+`check_board.sh`: every FAIL must be fixed; FC / service WARNs are fine.
+Don't install the boot service (`install_service.sh`) unless the user asks: it starts at boot, holds the
+camera and would block step 6.
 
 ## 6. Smoke test
 
@@ -285,7 +302,39 @@ skipped or failed.
 - `setup_hailo_sensor.sh` (in the image) detects 15L/15H and the IMX sensor; the image default points
   `medialib_configs` at hailo15h/imx678. The media server reads it at boot, hence `--reboot`.
 - A hard kill of the app leaves the ISP stuck (`post event failed` in dmesg, black video): reboot to recover.
-- The phys-ai dev image (`.claude/skills/h15-board-setup`) is the other route: everything is in the image, no bundle.
+- Phys-ai dev images (`kas/CI/hailo15l-sbc-vpu-phys-ai.yml`, or `PHYS_AI_SUPPORT`) ship the drone packages but
+  not pyzmq, and put `mavsdk_server` in `/usr/bin` (the app falls back to `PATH`). Their `python3-mavsdk` 2.12
+  imports `google.protobuf.runtime_version`, which their protobuf 3.20 lacks; `drone_follow_h15.py` stubs it.
+  Their source revisions are in the image itself: `/etc/hailo-rev/` (kas yml, layer commits, srcrevs).
+- mavsdk in the bundle is 2.8.4: the last 2.x on PyPI (2.12 is a Yocto build from git), protobuf-3 compatible,
+  and it ships `mavsdk_server` 2.12.10. 3.x needs protobuf >= 5; 4.x drops mavsdk_server/gRPC (different API).
+
+## Real flight controller, SITL
+
+- **Real FC:** `--serial /dev/ttyACM0` (USB). PX4 and ArduPilot both work: the app waits for OFFBOARD, and
+  MAVSDK reports ArduCopter **GUIDED as OFFBOARD** (offboard control drives GUIDED). Without `--takeoff-landing`
+  the app never arms and never changes mode; `--auto-offboard` sets the mode itself (bench / SITL only).
+  ArduCopter refuses GUIDED without a position estimate (indoors, no GPS).
+- **Boot service:** args in `/etc/default/drone-follow`, then `/etc/init.d/drone-follow restart`;
+  log `/var/log/drone-follow.log` (RAM, cleared on reboot: copy it off after a flight).
+- **PX4 SITL** (host with PX4 `main` + Gazebo Harmonic that reaches the board's link): add a MAVLink stream to the
+  board in `build/px4_sitl_default/etc/init.d-posix/airframes/4005_gz_x500_vision.post`:
+  `mavlink start -x -u 14590 -o 14540 -t 10.0.0.1 -r 4000000`, then `HEADLESS=1 make px4_sitl gz_x500_vision`
+  (stop with `shutdown` at `pxh>`, not Ctrl+C) and on the board, no `--serial`:
+  `python3 -m robot_follow.drone_follow_h15 --native-pipeline --takeoff-landing --auto-offboard`.
+  `Preflight Fail: No connection to the GCS` until the app connects (`mavlink status` at `pxh>`).
+
+## Troubleshooting
+
+| Symptom | Cause / fix |
+|---|---|
+| `native pipeline exited immediately with code -9` | Binary must be named `df_native_pipeline`; camera busy: `/etc/init.d/drone-follow stop`, `fuser /dev/video0` (`isp_media_server` on it is normal) |
+| `ModuleNotFoundError: zmq` | Bundle not installed: step 5 |
+| `mavsdk_server not found` | No bundle on a formal image, or old app code without the `PATH` fallback |
+| Waits forever for OFFBOARD | Nobody switched the mode (GCS: OFFBOARD on PX4, GUIDED on ArduPilot), or GUIDED refused for lack of position |
+| Board dates are 2018 | No RTC/NTP; expected, don't trust board timestamps |
+| Ping works, ssh drops, EXT4 I/O errors on console | Failing SD/eMMC: re-flash or replace the card |
+| No LEDs, PWR button does nothing | Hardware/power fault; nothing to do in software |
 
 ## Long-term: make formal images drone-ready (no bundle, faster flash)
 

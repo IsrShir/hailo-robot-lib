@@ -40,7 +40,7 @@ done
 # The app doesn't import pymavlink; only some tools do.
 pyimp pymavlink && ok "python: pymavlink" || warn "python: pymavlink missing (not needed by the app)"
 pyimp zmq && ok "python: zmq $(python3 -c 'import zmq; print(zmq.__version__)')" \
-    || bad "python: zmq missing (needed for --native-pipeline; run install_pyzmq.sh)"
+    || bad "python: zmq missing (needed for --native-pipeline; run install_bundle.sh)"
 
 echo "[hailo]"
 hailortcli fw-control identify >/dev/null 2>&1 && ok "hailortcli fw-control identify" \
@@ -61,7 +61,7 @@ echo "[app]"
 [ -f /home/root/robot_follow/ui/build/index.html ] && ok "web UI build" \
     || bad "web UI build missing (run build_ui.sh + install_app.sh)"
 [ -x /home/root/native_pipeline/df_native_pipeline ] && ok "native pipeline binary" \
-    || bad "native pipeline binary missing (run install_native.sh)"
+    || bad "native pipeline binary missing (run install_bundle.sh)"
 
 echo "[service]"
 if [ -x /etc/init.d/drone-follow ]; then

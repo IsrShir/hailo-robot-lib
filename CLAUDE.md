@@ -11,8 +11,7 @@ Sub-project knowledge lives under `.claude/`:
   - `tracking_callback_risks.md` — fragile spots in the detection callback / `highlight_target` probe — start here for tracking regressions.
 - `.claude/skills/drone-follow-dev/SKILL.md` — sim + drone-follow run loop, port hygiene, kill recipes.
 - `.claude/skills/safe-pull-and-rollback/SKILL.md` — tag-before-pull / compare / roll back / cross-machine tag share.
-- `.claude/skills/h15-board-setup/SKILL.md` — bring up a Hailo-15 board for `drone_follow_h15`: phys-ai image, u-boot TFTP flash, sensor, `scripts/h15_boot/install.sh` + `check_board.sh`, first run, SITL.
-- `.claude/skills/h15-vpu-setup/SKILL.md` — run `drone_follow_h15 --native-pipeline` on a **formal VPU release** (e.g. `vpu-stability-v1.13.0`): from the shuttle, stage + flash over the u-boot console (Board Init), build/install the runtime bundle, install the app, `--dry-run` smoke test.
+- `.claude/skills/h15-vpu-setup/SKILL.md` — bring up a Hailo-15 for `drone_follow_h15 --native-pipeline` on any image (a **formal VPU release** such as `vpu-stability-v1.13.0`, or a phys-ai dev build): on the shuttle or remotely, stage + flash over the u-boot console (Board Init), install the runtime bundle (only what the image lacks), the app, `--dry-run` smoke test; real FC / SITL notes, troubleshooting.
 
 Repo-wide knowledge (not drone-follow-specific) is in `.hailo/memory/` at the repo root — pipeline patterns, common pitfalls, etc.
 

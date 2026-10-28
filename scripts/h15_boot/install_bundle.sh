@@ -1,6 +1,8 @@
 #!/bin/bash
 # Install a drone-follow runtime bundle (from build_bundle.sh) onto a Hailo15
-# board running a formal VPU release image, then configure the sensor and verify.
+# board, then configure the sensor and verify. Works on a formal VPU release
+# image (installs everything) and on a phys-ai dev image (installs only what it
+# lacks, e.g. pyzmq; keeps the image's own mavsdk / numpy / pyhailort ...).
 #
 # Usage:
 #   ./install_bundle.sh <bundle.tar.gz>                  # target root@10.0.0.1
@@ -15,11 +17,13 @@
 # What it does:
 #   1. Preflight: the board must match the bundle (arch, Python, libhailort md5)
 #      and have room for it. Nothing is changed if this fails.
-#   2. Stops the drone-follow service if present, removes a previous bundle.
-#   3. Unpacks the bundle under / (new paths only; no image file is overwritten).
+#   2. Stops the drone-follow service if present, removes a previous bundle
+#      (only what that bundle installed, per bundle-installed.txt).
+#   3. Unpacks the bundle under /, skipping every Python package whose module the
+#      image already provides; records what it installed in bundle-installed.txt.
 #   4. Runs setup_hailo_sensor.sh (detects 15L/15H and the IMX sensor).
 #   5. Verifies imports, mavsdk_server, the HEF, VDevice and the native binary.
-# App code and the boot service are installed separately (install.sh).
+# App code and the boot service are installed separately (install_app.sh, install.sh).
 
 set -eEuo pipefail
 
@@ -74,15 +78,38 @@ echo "[2/5] Stopping drone-follow (if installed) and removing a previous bundle.
 target_ssh "sh -s" <<EOF
 [ -x /etc/init.d/drone-follow ] && /etc/init.d/drone-follow stop >/dev/null 2>&1 || true
 old=/usr/share/drone-follow/bundle-manifest.txt
+inst=/usr/share/drone-follow/bundle-installed.txt
 if [ -f \$old ]; then
     echo "  removing previous bundle: \$(sed -n 's/^release=//p' \$old) built \$(sed -n 's/^built=//p' \$old)"
-    sed -n 's/^site=//p' \$old | while read -r e; do [ -n "\$e" ] && rm -rf "$SITE/\$e"; done
+    # Only what that bundle installed. Bundles from before bundle-installed.txt
+    # installed every site= entry of their manifest.
+    if [ -f \$inst ]; then cat \$inst; else sed -n 's/^site=//p' \$old; fi \\
+        | while read -r e; do [ -n "\$e" ] && rm -rf "$SITE/\$e"; done
+    rm -f \$inst
 fi
 EOF
 
 # --- 3. Unpack ----------------------------------------------------------------------
 echo "[3/5] Unpacking bundle under / ..."
-target_ssh "tar xzf - -C /" < "$BUNDLE"
+# Which packages does the image already have? find_spec, not import: the phys-ai
+# image's mavsdk only imports with the protobuf stub drone_follow_h15.py applies.
+PKGS=$(echo "$MANIFEST" | sed -n 's/^pkg=//p')
+if [ -n "$PKGS" ]; then
+    PLAN=$(echo "$PKGS" | target_ssh 'while read -r name mod entries; do
+        if python3 -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec(\"$mod\") else 1)" 2>/dev/null
+        then echo "skip $name $mod $entries"; else echo "install $name $mod $entries"; fi
+    done')
+    echo "$PLAN" | awk 'NF {printf "  %-7s %-18s (%s)\n", $1, $2, $3}'
+    EXCLUDE=$(echo "$PLAN" | awk -v site=".$SITE" '$1 == "skip" { n = split($4, e, ","); for (i = 1; i <= n; i++) print site "/" e[i] "\n" site "/" e[i] "/*" }')
+    INSTALLED=$(echo "$PLAN" | awk '$1 == "install" { n = split($4, e, ","); for (i = 1; i <= n; i++) print e[i] }')
+else
+    # Bundle from before per-package lines: install everything, as before.
+    EXCLUDE=""
+    INSTALLED=$(echo "$MANIFEST" | sed -n 's/^site=//p')
+fi
+echo "$EXCLUDE" | target_ssh "cat > /tmp/df_bundle_exclude"
+target_ssh "tar xzf - -X /tmp/df_bundle_exclude -C / && rm -f /tmp/df_bundle_exclude" < "$BUNDLE"
+echo "$INSTALLED" | grep . | target_ssh "cat > /usr/share/drone-follow/bundle-installed.txt"
 
 # --- 4. Sensor ------------------------------------------------------------------------
 echo "[4/5] Configuring sensor (setup_hailo_sensor.sh)..."
@@ -99,6 +126,13 @@ target_ssh "sh -s" <<'EOF'
 fail=0
 python3 - <<'PY' || fail=1
 import importlib
+import types
+import google.protobuf as pb
+if not hasattr(pb, "runtime_version"):  # same stub as drone_follow_h15.py (phys-ai image's mavsdk)
+    rv = types.ModuleType("runtime_version")
+    rv.ValidateProtobufRuntimeVersion = lambda *a, **k: None
+    rv.Domain = type("Domain", (), {"PUBLIC": 1})()
+    pb.runtime_version = rv
 for m in ("numpy", "zmq", "grpc", "google.protobuf", "mavsdk", "hailo_platform"):
     try:
         mod = importlib.import_module(m)
@@ -106,8 +140,10 @@ for m in ("numpy", "zmq", "grpc", "google.protobuf", "mavsdk", "hailo_platform")
     except Exception as e:
         print("  FAIL import %-16s %s" % (m, e)); raise SystemExit(1)
 PY
-srv=$(python3 -c 'import mavsdk, os; print(os.path.join(os.path.dirname(mavsdk.__file__), "bin", "mavsdk_server"))')
-[ -x "$srv" ] && echo "  ok   mavsdk_server at $srv" || { echo "  FAIL mavsdk_server not executable at $srv"; fail=1; }
+# Where the app looks: mavsdk/bin (pip wheel) first, then PATH (phys-ai image: /usr/bin).
+srv=$(python3 -c 'import importlib.util, os; s = importlib.util.find_spec("mavsdk"); print(os.path.join(os.path.dirname(s.origin), "bin", "mavsdk_server"))')
+[ -x "$srv" ] || srv=$(command -v mavsdk_server || true)
+[ -n "$srv" ] && [ -x "$srv" ] && echo "  ok   mavsdk_server at $srv" || { echo "  FAIL mavsdk_server not found (mavsdk/bin or PATH)"; fail=1; }
 hef=""
 for h in /home/root/apps/shared/resources/hailo_yolov8s_384_640.hef /home/root/apps/shared/resources/hailo_yolov8n_384_640.hef; do
     [ -f $h ] && { hef=$h; break; }
@@ -148,5 +184,4 @@ if [ "$REBOOT" = 1 ]; then
 else
     echo "Reboot the board before running the app so the media server picks up the sensor config."
 fi
-echo "Next: scripts/h15_boot/build_ui.sh && scripts/h15_boot/install_app.sh $TARGET"
-echo "      (not install.sh: on a formal image the bundle already provides pyzmq and the native binary)."
+echo "Next: scripts/h15_boot/install.sh $TARGET   (UI build, app, service, check)"
