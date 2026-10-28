@@ -37,6 +37,9 @@ Host h15-<shuttle-short-name>
 ```
 In remote mode, pass the laptop key to the board in step 1 (`EXTRA_PUBKEYS="$(cat ~/.ssh/id_ed25519.pub)"`)
 and start the flash detached (step 3), or the ssh call stays open for the whole flash.
+Never source `shuttle.env` on the laptop: it points `H15_WORK` / `H15_IMAGES` at shuttle paths (`/local/...`)
+and `build_bundle.sh` fails with `mkdir: cannot create directory '/local'`. On the laptop the bundle goes
+to `~/h15_bundle_work` (step 4's default).
 
 Why a formal release needs more than flashing: it has no phys-ai packagegroup, so numpy, pyzmq,
 mavsdk + mavsdk_server, grpcio, protobuf and pyhailort are missing, and its HailoRT / media library
@@ -147,6 +150,41 @@ swupdate image → swupdate pulls `hailo-update-image-<machine>.swu` over TFTP �
 `init-partitions-single`, `init-scu-bl`, `copy-a` (copy-a can be silent for minutes) → reboot → `login:`.
 Exit 0 = flashed. Exit 2 = port busy (ask the user to close their terminal). Exit 1/3 = read the tail of
 `~/h15_console.log` and report it. The board answers ping but refuses ssh while swupdate runs; that's normal.
+`FAILED: Kernel panic - not syncing: Version mismatch!` (with `arm-scmi: Firmware version mismatch:
+linux(kernel)=0x..., fw=0x...` in the console log) = the board's SCU firmware is newer than the release:
+see 3a. Nothing was written yet, and the board resets itself ~10 s after the panic and boots its old
+image again: no power-cycle needed.
+
+### 3a. SCU firmware newer than the release (CI shuttles)
+
+Board Init can't change the SCU firmware before its own kernel boots, and that kernel refuses a newer
+one. CI nodes leave the board on a recent develop build, so any formal release hits this there
+(seen 2026-10-28 on had-1321: board `fw=0x330001`, v1.13.0 kernel wants `0x320001`). The fix is what every
+CI job on the shuttle does anyway: burn the SCU firmware, SCU bootloader and u-boot over UART recovery,
+then run Board Init. Use CI's own script, fed with the files staged in step 2 (CI's `image_files` stays
+untouched); the next CI job burns its own firmware again.
+
+Take the flags from the shuttle's latest CI job, so they match its board:
+```bash
+on_shuttle "cat \$(ls -td /local/workspace/*/results_dir/*/setup_preparation_logs | head -1)/setup_preparation_cmd.txt"
+```
+Keep its `--use-uart-recovery --platform-type ... --scu-fw-flavor ... --uboot-source ... --recovery-device ...
+--emmc-boot-partition ... --emmc-bit-mode ...`; replace `--yocto-remote-path`, `--clean-image-files` and
+`--builder-ip` with `--image-files-path`. On had-1321 (H15L) that gave, run detached:
+```bash
+on_shuttle "mkdir -p ~/h15_ci_prep && cd /local/workspace/mercury_one_stage && (nohup mercury_venv/bin/python3 \
+  setup_preparation.py --results-dir \$HOME/h15_ci_prep EMMC_BOARD_INIT \
+  --image-files-path \$H15_IMAGES/<release>/<machine> --yocto-machine-name <machine> --use-uart-recovery \
+  --platform-type H15L_SBC_ON_BOARD --scu-fw-flavor hailo15l --uboot-source mmc2_boot --recovery-device sdio1 \
+  --emmc-boot-partition 0 --emmc-bit-mode 4 > \$HOME/h15_ci_prep/run.out 2>&1 < /dev/null &)"
+on_shuttle "tail -5 ~/h15_ci_prep/run.out"; on_shuttle "pgrep -f '[s]etup_preparation.py'"   # progress / still running?
+```
+~10 min on had-1321: UART burn ~3.5 min (`Programming ...` / `Storage program validatation passed` per file),
+then Board Init (`Running Command run boot_swupdate_sdio1_only_a`, swupdate modes, `login:`); ends with
+`MBIST: all domains passed`. It points `/srv/tftp` at the staged folder itself; step 7's revert still applies.
+Save `run.out` as `3_flash.log` in the run directory. Then `vpu_board_key.sh` + `vpu_detect.sh` as below;
+`dmesg | grep 'SCMI.*Firmware version'` on the board shows the SCU firmware it now runs. This needs the
+CI workspace on the shuttle; on a shuttle without one, stop and tell the user.
 
 After it returns 0: `scripts/h15_boot/vpu_board_key.sh` again (the flash wiped the keys; pass `EXTRA_PUBKEYS`
 again in remote mode), then
@@ -158,7 +196,7 @@ Never use `run update_partitions_mmc1` / `update_rootfs` for these releases: u-b
 ## 4. Build the runtime bundle
 
 ```bash
-B=$H15_WORK/<release>/<machine>/drone-follow-bundle-<release>-<machine>.tar.gz
+B=${H15_WORK:-$HOME/h15_bundle_work}/<release>/<machine>/drone-follow-bundle-<release>-<machine>.tar.gz
 [ -f "$B" ] || scripts/h15_boot/build_bundle.sh --release <release> --machine <machine>
 ```
 First run per release/machine fetches and installs the SDK (~3 GB, several minutes), builds pyhailort
@@ -192,7 +230,9 @@ scripts/h15_boot/vpu_smoke.sh "$TARGET" 45
 ```
 Runs `--native-pipeline --dry-run` for 45 s, checks the web UI answers on `:5001`, stops the app with one
 SIGINT and reports dry-run commands (non-zero yaw = a person was followed). It never SIGKILLs the app:
-that wedges the ISP until a reboot.
+that wedges the ISP until a reboot. It also reports the board's RAM and the lowest free memory outside
+CMA while the app ran (on v1.13.0 H15L: 1.9 GB total, 1.28 GB CMA, 160-210 MB free). Put it in the report; a board left
+with only a few tens of MB can pass the 45 s run and still hang minutes later.
 
 ### Live view for the user
 

@@ -61,9 +61,14 @@ EOF
 echo "  web UI on the board's port $UI_PORT: $ui"
 
 # Wait for timeout's SIGINT to land and the app to shut down (pipeline + mavsdk).
+# While it runs, track the lowest free memory outside CMA: most of the RAM is CMA
+# (video buffers), and the app lives in what's left.
+min_free=""
 for _ in $(seq 1 $((SECS + 40))); do
     sleep 1
-    target_ssh "pgrep -f '$APP_PAT' >/dev/null" || break
+    free=$(target_ssh "pgrep -f '$APP_PAT' >/dev/null && \
+        awk '/^MemFree:/{f=\$2} /^CmaFree:/{c=\$2} END{print int((f-c)/1024)}' /proc/meminfo") || break
+    if [ -z "$min_free" ] || [ "$free" -lt "$min_free" ]; then min_free=$free; fi
 done
 if target_ssh "pgrep -f '$APP_PAT' >/dev/null"; then
     echo "ERROR: the app is still running 40 s after SIGINT. Not killing it (that wedges the ISP)."
@@ -78,6 +83,7 @@ moving=\$(grep '\[dry-run\] cmd' \$log | grep -vc 'yaw=0.00 deg/s')
 lost=\$(grep -c 'target lost' \$log)
 echo "  dry-run commands: \$cmds (\$moving with a non-zero yaw = a person was followed), target-lost: \$lost"
 grep -E 'Traceback|exited immediately|Error|ERROR' \$log | grep -v 'dry-run' | head -5 | sed 's/^/  log: /'
+awk '/^MemTotal:/{t=\$2} /^CmaTotal:/{c=\$2} END{printf "  RAM: %d MB total, %d MB CMA; lowest free outside CMA while the app ran: ${min_free:-?} MB\n", t/1024, c/1024}' /proc/meminfo
 dmesg | grep -q 'post event failed' && echo "  WARN dmesg has 'post event failed' (ISP stuck: reboot the board)"
 echo "  full log on the board: \$log"
 EOF
