@@ -51,9 +51,9 @@ steps 4-6 run, and save every step with `set -o pipefail; <command> 2>&1 | tee "
 ## 1. Detect the board (on the shuttle)
 
 ```bash
-scripts/h15_boot/vpu_board_key.sh && scripts/h15_boot/vpu_detect.sh
+scripts/h15_boot/vpu_detect.sh
 ```
-`vpu_board_key.sh` installs the shuttle's board key (and, in remote mode, the laptop's) with sshpass.
+It first installs the shuttle's board key (and, in remote mode, the laptop's) with sshpass.
 - `BOARD_STATE=linux`: `MACHINE` is the board (if the user gave a different one, stop and ask). If it already
   runs the image (release: `RELEASE`; image folder: `IMAGE_NAME` vs the folder's `.uid`), skip to step 4.
 - `no-ssh` / `down`: `scripts/h15_boot/vpu_console.py detect --reset manual` → `BOARD=`.
@@ -82,8 +82,7 @@ and the board reboots its old image. Flash through the shuttle's CI tooling inst
 scripts/h15_boot/vpu_ci_board_init.sh --image-dir $H15_IMAGES/<name>/<machine> --machine <machine>         # shows the command
 scripts/h15_boot/vpu_ci_board_init.sh --image-dir $H15_IMAGES/<name>/<machine> --machine <machine> --run   # ~10 min
 ```
-Show the user the command before `--run`. After a flash: `vpu_board_key.sh` again (keys are wiped), then
-`vpu_detect.sh` must show the new image.
+Show the user the command before `--run`. After a flash, `vpu_detect.sh` again (it reinstalls the wiped keys) must show the new image.
 
 ## 4. Build the runtime bundle (where the repo is)
 

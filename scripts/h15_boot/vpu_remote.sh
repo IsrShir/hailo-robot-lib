@@ -14,7 +14,7 @@
 #
 # setup also writes a ~/.ssh/config alias h15-<last octet> (root@10.0.0.1 via
 # ProxyJump through the shuttle); the laptop-side steps use it as their target.
-# run passes this laptop's public keys as EXTRA_PUBKEYS, so vpu_board_key.sh
+# run passes this laptop's public keys as EXTRA_PUBKEYS, so vpu_detect.sh
 # also lets the laptop log in to the board.
 
 set -euo pipefail
@@ -23,7 +23,7 @@ S=${2:?shuttle (hailo@<ip>) required}
 shift 2
 R=.cache/h15_vpu_setup
 HERE="$(cd "$(dirname "$0")" && pwd)"
-SHUTTLE_FILES=(common.sh shuttle.env vpu_stage.sh vpu_console.py vpu_board_key.sh vpu_detect.sh vpu_ci_board_init.sh)
+SHUTTLE_FILES=(common.sh shuttle.env vpu_stage.sh vpu_console.py vpu_detect.sh vpu_ci_board_init.sh)
 SSH=(ssh -o BatchMode=yes -o ConnectTimeout=15)
 
 # One remote command line: cd to the script copy, load shuttle.env, then the args (quoted).

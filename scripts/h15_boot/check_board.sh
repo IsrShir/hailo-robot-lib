@@ -4,12 +4,16 @@
 #
 # Usage:
 #   ./check_board.sh [root@<ip>]
+#   ./check_board.sh --runtime [root@<ip>]   # only what the bundle provides (no app / service);
+#                                            # install_bundle.sh runs this as its verify step
 
 set -e
-source "$(dirname "$0")/common.sh"
+RUNTIME_ONLY=0
+if [ "${1:-}" = --runtime ]; then RUNTIME_ONLY=1; shift; fi
+source "$(dirname "$0")/common.sh" "$@"
 
-echo "=== Checking $TARGET ==="
-target_ssh 'sh -s' <<'REMOTE'
+echo "=== Checking $TARGET$([ "$RUNTIME_ONLY" = 1 ] && echo " (runtime only)") ==="
+target_ssh "RUNTIME_ONLY=$RUNTIME_ONLY sh -s" <<'REMOTE'
 fails=0
 ok()   { echo "  PASS  $1"; }
 warn() { echo "  WARN  $1"; }
@@ -46,7 +50,22 @@ echo "[hailo]"
 hailortcli fw-control identify >/dev/null 2>&1 && ok "hailortcli fw-control identify" \
     || bad "hailortcli fw-control identify failed"
 HEF=/home/root/apps/shared/resources/hailo_yolov8s_384_640.hef
-[ -f "$HEF" ] && ok "model: $HEF" || bad "model missing: $HEF"
+if [ ! -f "$HEF" ]; then
+    bad "model missing: $HEF"
+elif pgrep -f '^python3 -m robot_follow' >/dev/null; then
+    ok "model: $HEF (load not tried: the app is running and holds the device)"
+elif python3 - "$HEF" >/dev/null 2>&1 <<'PY'
+import sys
+from hailo_platform import HEF, VDevice
+HEF(sys.argv[1])
+with VDevice() as vd:
+    vd.create_infer_model(sys.argv[1])
+PY
+then ok "model loads on the device: $HEF (HEF + VDevice)"
+else bad "model doesn't load on the device: $HEF (pyhailort vs HailoRT mismatch?)"
+fi
+[ -x /home/root/native_pipeline/df_native_pipeline ] && /home/root/native_pipeline/df_native_pipeline --help >/dev/null 2>&1 \
+    && ok "native pipeline binary loads" || bad "native pipeline binary missing or doesn't load (run install_bundle.sh)"
 
 echo "[camera]"
 if [ -e /etc/imaging/cfg/medialib_configs ]; then
@@ -55,13 +74,17 @@ else
     bad "no /etc/imaging/cfg/medialib_configs (run setup_hailo_sensor.sh)"
 fi
 
+echo "[flight controller]"
+{ [ -d /sys/bus/usb/drivers/cdc_acm ] || modinfo -n cdc_acm >/dev/null 2>&1; } && ok "USB serial driver cdc_acm" \
+    || bad "no cdc_acm driver: a USB FC gets no /dev/ttyACM0 (v1.12.1: install a current bundle)"
+[ -e /dev/ttyACM0 ] && ok "/dev/ttyACM0 present" || warn "no /dev/ttyACM0 (FC not connected; fine for --dry-run / SITL)"
+
+if [ "$RUNTIME_ONLY" != 1 ]; then
 echo "[app]"
 [ -f /home/root/robot_follow/drone_follow_h15.py ] && ok "app: /home/root/robot_follow" \
     || bad "app missing (run install_app.sh)"
 [ -f /home/root/robot_follow/ui/build/index.html ] && ok "web UI build" \
     || bad "web UI build missing (run build_ui.sh + install_app.sh)"
-[ -x /home/root/native_pipeline/df_native_pipeline ] && ok "native pipeline binary" \
-    || bad "native pipeline binary missing (run install_bundle.sh)"
 
 echo "[service]"
 if [ -x /etc/init.d/drone-follow ]; then
@@ -76,11 +99,7 @@ if [ -x /etc/init.d/drone-follow ]; then
 else
     warn "service not installed (run install_service.sh)"
 fi
-
-echo "[flight controller]"
-{ [ -d /sys/bus/usb/drivers/cdc_acm ] || modinfo -n cdc_acm >/dev/null 2>&1; } && ok "USB serial driver cdc_acm" \
-    || bad "no cdc_acm driver: a USB FC gets no /dev/ttyACM0 (v1.12.1: install a current bundle)"
-[ -e /dev/ttyACM0 ] && ok "/dev/ttyACM0 present" || warn "no /dev/ttyACM0 (FC not connected; fine for --dry-run / SITL)"
+fi
 
 echo
 if [ "$fails" -eq 0 ]; then echo "All required checks passed."; else echo "$fails check(s) FAILED."; fi

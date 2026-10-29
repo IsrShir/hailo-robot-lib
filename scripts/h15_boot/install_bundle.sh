@@ -23,7 +23,8 @@
 #      image already provides; records what it installed in bundle-installed.txt.
 #      A cdc-acm.ko in the bundle (kernel without the driver) is always installed.
 #   4. Runs setup_hailo_sensor.sh (detects 15L/15H and the IMX sensor).
-#   5. Verifies imports, mavsdk_server, the HEF, VDevice and the native binary.
+#   5. Verifies with check_board.sh --runtime (imports, mavsdk_server, HEF + VDevice,
+#      native binary, sensor, FC driver).
 # App code and the boot service are installed separately (install_app.sh, install.sh).
 
 set -eEuo pipefail
@@ -127,53 +128,8 @@ cfg=/etc/imaging/cfg/medialib_configs/face_landmarks_medialib_config.json
 EOF
 
 # --- 5. Verify ----------------------------------------------------------------------------
-echo "[5/5] Verifying..."
-target_ssh "sh -s" <<'EOF'
-fail=0
-python3 - <<'PY' || fail=1
-import importlib
-import types
-import google.protobuf as pb
-if not hasattr(pb, "runtime_version"):  # same stub as drone_follow_h15.py (phys-ai image's mavsdk)
-    rv = types.ModuleType("runtime_version")
-    rv.ValidateProtobufRuntimeVersion = lambda *a, **k: None
-    rv.Domain = type("Domain", (), {"PUBLIC": 1})()
-    pb.runtime_version = rv
-for m in ("numpy", "zmq", "grpc", "google.protobuf", "mavsdk", "hailo_platform"):
-    try:
-        mod = importlib.import_module(m)
-        print("  ok   import %-16s %s" % (m, getattr(mod, "__version__", "")))
-    except Exception as e:
-        print("  FAIL import %-16s %s" % (m, e)); raise SystemExit(1)
-PY
-# Where the app looks: mavsdk/bin (pip wheel) first, then PATH (phys-ai image: /usr/bin).
-srv=$(python3 -c 'import importlib.util, os; s = importlib.util.find_spec("mavsdk"); print(os.path.join(os.path.dirname(s.origin), "bin", "mavsdk_server"))')
-[ -x "$srv" ] || srv=$(command -v mavsdk_server || true)
-[ -n "$srv" ] && [ -x "$srv" ] && echo "  ok   mavsdk_server at $srv" || { echo "  FAIL mavsdk_server not found (mavsdk/bin or PATH)"; fail=1; }
-hef=""
-for h in /home/root/apps/shared/resources/hailo_yolov8s_384_640.hef /home/root/apps/shared/resources/hailo_yolov8n_384_640.hef; do
-    [ -f $h ] && { hef=$h; break; }
-done
-if [ -n "$hef" ]; then
-    python3 - "$hef" <<'PY' || fail=1
-import sys
-from hailo_platform import HEF, VDevice
-hef = HEF(sys.argv[1])
-print("  ok   HEF %s: %s" % (sys.argv[1].rsplit("/", 1)[-1], hef.get_network_group_names()))
-with VDevice() as vd:
-    vd.create_infer_model(sys.argv[1])
-    print("  ok   VDevice + create_infer_model")
-PY
-else
-    echo "  FAIL no yolov8 HEF in /home/root/apps/shared/resources"; fail=1
-fi
-{ [ -d /sys/bus/usb/drivers/cdc_acm ] || modinfo -n cdc_acm >/dev/null 2>&1; } && echo "  ok   USB serial driver cdc_acm (FC /dev/ttyACM0)" \
-    || { echo "  FAIL no cdc_acm driver: rebuild the bundle with the current build_bundle.sh"; fail=1; }
-/home/root/native_pipeline/df_native_pipeline --help >/dev/null 2>&1 \
-    && echo "  ok   df_native_pipeline loads (--help)" \
-    || { echo "  FAIL df_native_pipeline --help failed (missing library?)"; fail=1; }
-exit $fail
-EOF
+echo "[5/5] Verifying (check_board.sh --runtime)..."
+"$(dirname "$0")/check_board.sh" --runtime "$TARGET"
 
 echo ""
 echo "===== Bundle installed ====="

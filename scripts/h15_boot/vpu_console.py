@@ -9,11 +9,9 @@ Subcommands:
            The board TFTPs fitImage + the swupdate image from the shuttle, boots
            it, pulls hailo-update-image-<machine>.swu and writes eMMC/SD. Stage
            the release and point TFTP at it first (vpu_stage.sh).
-  watch    only follow an update that is already running (e.g. started by hand).
 
-The board is reset over ssh (`--reset ssh`, default; needs vpu_board_key.sh),
-by sending `reboot` at a console shell (`--reset console`), or by a person
-(`--reset manual`: power-cycle or press reset when asked).
+The board is reset over ssh (`--reset ssh`, default; needs vpu_detect.sh's key)
+or by a person (`--reset manual`: power-cycle or press reset when asked).
 
 Never takes the serial port from another program: if picocom/minicom/screen
 holds it, this exits with code 2 and names the process.
@@ -113,23 +111,11 @@ class Console:
         return dict(re.findall(r"^([\w.]+)=(.*)$", out, re.M))
 
 
-def reset_board(con, how, target, ssh_opts):
+def reset_board(how, target, ssh_opts):
     if how == "ssh":
         log(f"Rebooting {target} over ssh...")
         subprocess.run(["ssh", *shlex.split(ssh_opts), target, "reboot"],
                        capture_output=True, timeout=30)
-    elif how == "console":
-        log("Sending reboot at the console...")
-        con.child.sendline("")
-        i = con.child.expect(["login:", r"# ?$", pexpect.TIMEOUT], timeout=10)
-        if i == 0:
-            con.child.sendline("root")
-            con.child.expect("Password:", timeout=10)
-            con.child.sendline(os.environ.get("BOARD_PASSWORD", "root"))
-            con.child.expect(r"# ?$", timeout=15)
-        elif i == 2:
-            raise RuntimeError("no shell on the console; use --reset manual")
-        con.child.sendline("reboot")
     else:
         log("Power-cycle the board or press its reset button now.")
 
@@ -141,7 +127,7 @@ def go_to_prompt(args):
             "Close that terminal (picocom: Ctrl+A Ctrl+X) and run again.")
         sys.exit(2)
     con = Console(args.tty, args.log)
-    reset_board(con, args.reset, args.target, args.ssh_opts)
+    reset_board(args.reset, args.target, args.ssh_opts)
     con.stop_autoboot(timeout=args.reset_timeout)
     log("At the u-boot prompt")
     return con
@@ -222,25 +208,13 @@ def cmd_flash(args):
         con.close()
 
 
-def cmd_watch(args):
-    users = port_users(args.tty)
-    if users:
-        log(f"Serial port {args.tty} is in use by: {', '.join(users)}")
-        return 2
-    con = Console(args.tty, args.log)
-    try:
-        return follow_update(con, args.timeout * 60, args.idle_timeout * 60)
-    finally:
-        con.close()
-
-
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("command", choices=["detect", "flash", "watch"])
+    p.add_argument("command", choices=["detect", "flash"])
     p.add_argument("--machine", help="hailo15l-sbc | hailo15-sbc | hailo15-sbc-rev3-1 (flash)")
     p.add_argument("--init-label", help="boot menu entry to run instead of the machine default")
     p.add_argument("--tty", default=os.environ.get("H15_TTY", "/dev/ttyUSB3"))
-    p.add_argument("--reset", choices=["ssh", "console", "manual"], default="ssh")
+    p.add_argument("--reset", choices=["ssh", "manual"], default="ssh")
     p.add_argument("--target", default=os.environ.get("TARGET", "root@10.0.0.1"))
     p.add_argument("--ssh-opts", default=os.environ.get("SSH_OPTS", "-o ProxyCommand=none"))
     p.add_argument("--reset-timeout", type=int, default=300, help="s to wait for u-boot after the reset")
@@ -251,7 +225,7 @@ def main():
     if args.command == "flash" and not args.machine:
         p.error("flash needs --machine")
     try:
-        sys.exit({"detect": cmd_detect, "flash": cmd_flash, "watch": cmd_watch}[args.command](args))
+        sys.exit({"detect": cmd_detect, "flash": cmd_flash}[args.command](args))
     except (pexpect.TIMEOUT, RuntimeError) as e:
         log(f"FAILED: {e if isinstance(e, RuntimeError) else 'timed out waiting for the console'}")
         sys.exit(3)
