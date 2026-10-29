@@ -20,6 +20,7 @@ link `10.0.0.2 <-> 10.0.0.1`, `tftpd-hpa` and the console). Steps 4-6 run where 
 - Remote mode (laptop): `scripts/h15_boot/vpu_remote.sh setup hailo@<ip>` once per run. It copies the shuttle
   scripts and adds the board alias `h15-<last octet>`, the `TARGET` of steps 4-6. Then run shuttle steps with
   `vpu_remote.sh run hailo@<ip> <command>` (long ones: `start <name> <command>` + `wait <name>`).
+  The command is argv, not a shell line: wrap pipes, `;`, `&&` or `$VARS` (e.g. step 0's checks) in `bash -c '...'`.
   Never source `shuttle.env` on the laptop (it points work dirs at shuttle paths).
 
 **What needs a person:** power, cables and boot switches (eMMC on H15L, SD on H15H); allowing

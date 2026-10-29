@@ -118,7 +118,7 @@ done
 OLD=$(readlink /srv/tftp 2>/dev/null || echo "(not a symlink)")
 TFTP_CMDS="sudo ln -sfn $DEST /srv/tftp && sudo systemctl restart tftpd-hpa"
 echo "[3/3] TFTP..."
-echo "  /srv/tftp now -> $OLD"
+echo "  /srv/tftp was -> $OLD"
 if [ "$DO_TFTP" = 1 ]; then
     # tftpd --secure chroots into /srv/tftp when it starts, so it must restart
     # to see a new symlink target.
