@@ -78,6 +78,8 @@ else
 fi
 
 echo "[flight controller]"
+{ [ -d /sys/bus/usb/drivers/cdc_acm ] || modinfo -n cdc_acm >/dev/null 2>&1; } && ok "USB serial driver cdc_acm" \
+    || bad "no cdc_acm driver: a USB FC gets no /dev/ttyACM0 (v1.12.1: install a current bundle)"
 [ -e /dev/ttyACM0 ] && ok "/dev/ttyACM0 present" || warn "no /dev/ttyACM0 (FC not connected; fine for --dry-run / SITL)"
 
 echo

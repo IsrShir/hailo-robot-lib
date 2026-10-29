@@ -31,6 +31,8 @@
 #   Layout is relative to / on the board:
 #     usr/lib/python3.X/site-packages/...           Python packages
 #     home/root/native_pipeline/df_native_pipeline  native pipeline binary
+#     lib/modules/<kernel>/extra/cdc-acm.ko         USB FC driver, only if the kernel lacks it
+#     etc/modules-load.d/cdc-acm.conf               ...loaded at boot
 #     usr/share/drone-follow/bundle-manifest.txt    what was built, from what
 
 set -eEuo pipefail
@@ -213,6 +215,31 @@ TOOLCHAIN_DIR="$SDK_DIR" "${NP_SRC}/robot_follow/native_pipeline/build.sh" --cle
 NP_BIN="${NP_SRC}/robot_follow/native_pipeline/build/df_native_pipeline"
 echo "      df_native_pipeline built ($NATIVE_COMMIT), needs: $("$READELF" -d "$NP_BIN" | grep NEEDED | grep -oE '\[[^]]+\]' | tr -d '[]' | tr '\n' ' ')"
 
+# cdc_acm gives a USB flight controller its /dev/ttyACM0; some kernels lack it (v1.12.1:
+# CONFIG_USB_ACM not set). Build it against the SDK's kernel-devsrc (the image's .config
+# and Module.symvers), with the driver source from the mainline tag of the same version.
+# env -i: the SDK env (CFLAGS, pkg-config sysroot, its ld first on PATH) breaks the
+# kernel's host tools. KERNELRELEASE: kernel-devsrc has no git, so without it the
+# -<n>-g<sha> suffix is lost and the board refuses the module.
+KSRC=$(readlink -f "${SYSROOT}/usr/src/kernel")
+KREL=$(cat "${KSRC}/include/config/kernel.release")
+KMOD=""
+if ! grep -qE '^CONFIG_USB_ACM=[ym]' "${KSRC}/.config"; then
+    KMOD="${OUT}/kmod/cdc-acm.ko"
+    rm -rf "${OUT}/kernel_tree" "${OUT}/kmod" && mkdir -p "${OUT}/kmod"
+    cp -a "${KSRC}/." "${OUT}/kernel_tree/"
+    for f in cdc-acm.c cdc-acm.h; do
+        curl -fsSL -o "${OUT}/kmod/$f" "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/drivers/usb/class/$f?h=v$(make -s -C "$KSRC" kernelversion)"
+    done
+    echo 'obj-m := cdc-acm.o' > "${OUT}/kmod/Kbuild"
+    KMAKE=(env -i "HOME=$HOME" "PATH=${OECORE_NATIVE_SYSROOT}/usr/bin/aarch64-poky-linux:/usr/bin:/bin"
+        make -C "${OUT}/kernel_tree" ARCH=arm64 CROSS_COMPILE=aarch64-poky-linux- "KERNELRELEASE=$KREL")
+    { "${KMAKE[@]}" olddefconfig && "${KMAKE[@]}" modules_prepare && "${KMAKE[@]}" "M=${OUT}/kmod" CONFIG_USB_ACM=m modules; } \
+        > "${OUT}/kmod_build.log" 2>&1 || { echo "ERROR: cdc-acm build failed, see ${OUT}/kmod_build.log" >&2; exit 1; }
+    [ "$(modinfo -F vermagic "$KMOD" | cut -d' ' -f1)" = "$KREL" ] || { echo "ERROR: cdc-acm.ko is not for $KREL" >&2; exit 1; }
+    echo "      cdc-acm.ko built for $KREL (not in the image's kernel)"
+fi
+
 # --- 5. PyPI wheels ---------------------------------------------------------------
 echo "[5/6] Downloading PyPI wheels for $PY_TAG aarch64..."
 WHEELS="${OUT}/wheels"
@@ -234,6 +261,10 @@ for w in "$WHEELS"/*.whl; do unzip -qo "$w" -d "$SITE"; done
 rm -rf "${SITE}/hailo_tutorials"
 chmod 755 "${SITE}/mavsdk/bin/mavsdk_server"
 install -m 755 "$NP_BIN" "${STAGE}/home/root/native_pipeline/df_native_pipeline"
+if [ -n "$KMOD" ]; then
+    install -D -m 644 "$KMOD" "${STAGE}/lib/modules/${KREL}/extra/cdc-acm.ko"
+    mkdir -p "${STAGE}/etc/modules-load.d" && echo cdc-acm > "${STAGE}/etc/modules-load.d/cdc-acm.conf"
+fi
 
 MANIFEST="${STAGE}/usr/share/drone-follow/bundle-manifest.txt"
 {
@@ -245,6 +276,8 @@ MANIFEST="${STAGE}/usr/share/drone-follow/bundle-manifest.txt"
     echo "libhailort_md5=$HRT_MD5"
     echo "native_ref=$NATIVE_REF@$NATIVE_COMMIT"
     for w in "$WHEELS"/*.whl; do echo "wheel=$(basename "$w")"; done
+    # "kmod=<kernel release> <files>": install_bundle.sh checks the kernel, removes the files later.
+    [ -z "$KMOD" ] || echo "kmod=$KREL lib/modules/${KREL}/extra/cdc-acm.ko etc/modules-load.d/cdc-acm.conf"
 } > "$MANIFEST"
 # One line per package: "pkg=<name> <import module> <its top-level site-packages entries>".
 # install_bundle.sh skips a package whose module the image already imports (phys-ai images

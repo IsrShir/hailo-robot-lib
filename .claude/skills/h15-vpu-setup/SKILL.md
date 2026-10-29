@@ -51,6 +51,9 @@ library, and no image has pyzmq. A formal release also lacks the phys-ai package
 mavsdk_server, grpcio, protobuf, pyhailort); a phys-ai dev build has those. `build_bundle.sh` builds all of
 it from the image's SDK into one tarball; `install_bundle.sh` installs on the board **only the packages the
 image lacks** (so a phys-ai image keeps its own mavsdk, numpy, pyhailort) plus the native binary.
+Some releases also lack the USB serial driver a USB flight controller needs (v1.12.1: `CONFIG_USB_ACM`
+not set, so the FC enumerates but gets no `/dev/ttyACM0`; v1.13.0 has it built in). For those the bundle
+also carries `cdc-acm.ko`, built from the SDK's kernel tree, loaded at boot via `/etc/modules-load.d`.
 
 ## What needs a person
 
@@ -330,6 +333,7 @@ skipped or failed.
 |---|---|
 | `native pipeline exited immediately with code -9` | Binary must be named `df_native_pipeline`; camera busy: `/etc/init.d/drone-follow stop`, `fuser /dev/video0` (`isp_media_server` on it is normal) |
 | `ModuleNotFoundError: zmq` | Bundle not installed: step 5 |
+| FC in `dmesg` (`Pixhawk1`, `PX4 FMU`) but no `/dev/ttyACM0` | Kernel without `cdc_acm` (v1.12.1): install a bundle built by the current `build_bundle.sh`; `check_board.sh` FAILs on it |
 | `mavsdk_server not found` | No bundle on a formal image, or old app code without the `PATH` fallback |
 | Waits forever for OFFBOARD | Nobody switched the mode (GCS: OFFBOARD on PX4, GUIDED on ArduPilot), or GUIDED refused for lack of position |
 | Board dates are 2018 | No RTC/NTP; expected, don't trust board timestamps |
@@ -344,5 +348,6 @@ Image changes to propose for the release builds (meta-hailo-bsp / hailo-yocto-va
    `python3-numpy`, which the phys-ai image got only indirectly.
 2. `tftp -b 65464` in `init.initscripts-hailo-swupdate` (Board Init download on high-latency links, e.g.
    ~35 min on had-1060, → ~1-3 min).
+3. `CONFIG_USB_ACM=y` in the release kernel (missing in v1.12.1; the bundle builds the module meanwhile).
 With 1 in place, steps 4-5 shrink to `install_app.sh`; `build_bundle.sh` is still needed for the native
 binary unless it ships too.

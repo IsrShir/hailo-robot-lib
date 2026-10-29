@@ -21,6 +21,7 @@
 #      (only what that bundle installed, per bundle-installed.txt).
 #   3. Unpacks the bundle under /, skipping every Python package whose module the
 #      image already provides; records what it installed in bundle-installed.txt.
+#      A cdc-acm.ko in the bundle (kernel without the driver) is always installed.
 #   4. Runs setup_hailo_sensor.sh (detects 15L/15H and the IMX sensor).
 #   5. Verifies imports, mavsdk_server, the HEF, VDevice and the native binary.
 # App code and the boot service are installed separately (install_app.sh, install.sh).
@@ -64,6 +65,9 @@ if [ -f \$lib ]; then
 else
     echo "  FAIL \$lib not found: board runs a different HailoRT than the bundle"; fail=1
 fi
+kmod="$(mf kmod)"
+[ -z "\$kmod" ] || [ "\$(uname -r)" = "\${kmod%% *}" ] \
+    || { echo "  FAIL kernel \$(uname -r) is not the bundle's (\${kmod%% *}): wrong release?"; fail=1; }
 avail=\$(df -k / | tail -1 | awk '{print \$4}')
 [ "\$avail" -ge $NEED_KB ] && echo "  ok   \$((avail/1024)) MB free on /" \
     || { echo "  FAIL only \$((avail/1024)) MB free on /, need $((NEED_KB/1024)) MB"; fail=1; }
@@ -85,6 +89,7 @@ if [ -f \$old ]; then
     # installed every site= entry of their manifest.
     if [ -f \$inst ]; then cat \$inst; else sed -n 's/^site=//p' \$old; fi \\
         | while read -r e; do [ -n "\$e" ] && rm -rf "$SITE/\$e"; done
+    for f in \$(sed -n 's/^kmod=[^ ]* //p' \$old); do rm -f "/\$f"; done
     rm -f \$inst
 fi
 EOF
@@ -110,6 +115,7 @@ fi
 echo "$EXCLUDE" | target_ssh "cat > /tmp/df_bundle_exclude"
 target_ssh "tar xzf - -X /tmp/df_bundle_exclude -C / && rm -f /tmp/df_bundle_exclude" < "$BUNDLE"
 echo "$INSTALLED" | grep . | target_ssh "cat > /usr/share/drone-follow/bundle-installed.txt"
+[ -z "$(mf kmod)" ] || target_ssh "depmod -a && modprobe cdc_acm"
 
 # --- 4. Sensor ------------------------------------------------------------------------
 echo "[4/5] Configuring sensor (setup_hailo_sensor.sh)..."
@@ -161,6 +167,8 @@ PY
 else
     echo "  FAIL no yolov8 HEF in /home/root/apps/shared/resources"; fail=1
 fi
+{ [ -d /sys/bus/usb/drivers/cdc_acm ] || modinfo -n cdc_acm >/dev/null 2>&1; } && echo "  ok   USB serial driver cdc_acm (FC /dev/ttyACM0)" \
+    || { echo "  FAIL no cdc_acm driver: rebuild the bundle with the current build_bundle.sh"; fail=1; }
 /home/root/native_pipeline/df_native_pipeline --help >/dev/null 2>&1 \
     && echo "  ok   df_native_pipeline loads (--help)" \
     || { echo "  FAIL df_native_pipeline --help failed (missing library?)"; fail=1; }
