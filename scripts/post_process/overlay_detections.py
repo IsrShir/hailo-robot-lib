@@ -135,18 +135,20 @@ def _draw_tiles(frame, w, h, tiles):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
 
 
-def _draw_cross(frame, cx, cy):
-    """Draw a green '+' with black halo at (cx, cy) — matches the UI overlay."""
+def _draw_cross(frame, cx, cy, scale=1.0):
+    """Draw a green '+' with black halo at (cx, cy) — matches the UI overlay.
+
+    ``scale`` multiplies the UI's 640-px-wide sizes so the cross stays
+    visible on 4K recordings."""
+    half = int(CROSS_HALF_SIZE * scale)
+    halo = max(1, int(CROSS_HALO_STROKE * scale))
+    stroke = max(1, int(CROSS_STROKE * scale))
     # Black halo first
-    cv2.line(frame, (cx - CROSS_HALF_SIZE, cy), (cx + CROSS_HALF_SIZE, cy),
-             (0, 0, 0), CROSS_HALO_STROKE, cv2.LINE_AA)
-    cv2.line(frame, (cx, cy - CROSS_HALF_SIZE), (cx, cy + CROSS_HALF_SIZE),
-             (0, 0, 0), CROSS_HALO_STROKE, cv2.LINE_AA)
+    cv2.line(frame, (cx - half, cy), (cx + half, cy), (0, 0, 0), halo, cv2.LINE_AA)
+    cv2.line(frame, (cx, cy - half), (cx, cy + half), (0, 0, 0), halo, cv2.LINE_AA)
     # Green cross on top (BGR for OpenCV: #80f060 → (96, 240, 128))
-    cv2.line(frame, (cx - CROSS_HALF_SIZE, cy), (cx + CROSS_HALF_SIZE, cy),
-             (96, 240, 128), CROSS_STROKE, cv2.LINE_AA)
-    cv2.line(frame, (cx, cy - CROSS_HALF_SIZE), (cx, cy + CROSS_HALF_SIZE),
-             (96, 240, 128), CROSS_STROKE, cv2.LINE_AA)
+    cv2.line(frame, (cx - half, cy), (cx + half, cy), (96, 240, 128), stroke, cv2.LINE_AA)
+    cv2.line(frame, (cx, cy - half), (cx, cy + half), (96, 240, 128), stroke, cv2.LINE_AA)
 
 
 def draw_overlay(frame, record, w, h, show_tiles=False, tiles=None):
@@ -160,6 +162,7 @@ def draw_overlay(frame, record, w, h, show_tiles=False, tiles=None):
     if record is None:
         return
     following_id = record.get("following_id")
+    scale = max(1.0, w / 640.0)  # UI sizes are for 640-px-wide video
     for det in record.get("detections", []):
         bb = det.get("bbox")
         if not bb:
@@ -170,15 +173,15 @@ def draw_overlay(frame, record, w, h, show_tiles=False, tiles=None):
         y2 = int((bb["y"] + bb["h"]) * h)
         is_followed = (det.get("id") is not None and det["id"] == following_id)
         color = (0, 255, 0) if is_followed else (255, 255, 255)
-        thickness = 3 if is_followed else 2
+        thickness = int((3 if is_followed else 2) * scale)
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
         label = f"ID {det.get('id', '?')}  {int(det.get('confidence', 0) * 100)}%"
-        cv2.putText(frame, label, (x1, max(0, y1 - 6)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, cv2.LINE_AA)
+        cv2.putText(frame, label, (x1, max(int(18 * scale), y1 - int(6 * scale))),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5 * scale, color, int(2 * scale), cv2.LINE_AA)
         if is_followed:
             cx = (x1 + x2) // 2
             cy = (y1 + y2) // 2
-            _draw_cross(frame, cx, cy)
+            _draw_cross(frame, cx, cy, scale)
 
 
 def main():
