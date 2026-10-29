@@ -2,10 +2,11 @@
 # Edit this file and restart: /etc/init.d/drone-follow restart
 
 # Command-line arguments for drone_follow_h15
-# Real drone via Pixhawk serial:
-DRONE_FOLLOW_ARGS="--serial /dev/ttyACM0"
+# Real drone via Pixhawk serial, tiled native detection pipeline:
+DRONE_FOLLOW_ARGS="--native-pipeline --serial /dev/ttyACM0"
 
 # Other examples:
-# DRONE_FOLLOW_ARGS=""                                       # PX4 SITL over UDP
-# DRONE_FOLLOW_ARGS="--serial /dev/ttyACM0 --auto-offboard"  # bench testing
-# DRONE_FOLLOW_ARGS="--dry-run"                              # no drone connection
+# DRONE_FOLLOW_ARGS="--native-pipeline"                                       # PX4 SITL over UDP
+# DRONE_FOLLOW_ARGS="--native-pipeline --serial /dev/ttyACM0 --auto-offboard" # bench testing
+# DRONE_FOLLOW_ARGS="--native-pipeline --dry-run"                             # no drone connection
+# DRONE_FOLLOW_ARGS="--serial /dev/ttyACM0"                                   # older Python pipeline (no tiling)

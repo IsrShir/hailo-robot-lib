@@ -12,6 +12,7 @@ import asyncio
 import logging
 import math
 import os
+import shutil
 import signal
 import subprocess
 import time
@@ -305,6 +306,23 @@ def add_drone_args(parser) -> None:
 # mavsdk_server process management
 # ---------------------------------------------------------------------------
 
+def _find_mavsdk_server() -> Optional[str]:
+    """Locate the mavsdk_server binary.
+
+    pip's mavsdk wheel bundles it at ``mavsdk/bin/mavsdk_server`` (RPi / x86).
+    The Hailo15 Yocto image ships python3-mavsdk without the bundled binary
+    and installs the ``mavsdk-server`` package at ``/usr/bin/mavsdk_server``,
+    so fall back to PATH.
+    """
+    try:
+        bundled = os.path.join(os.path.dirname(mavsdk.__file__), 'bin', 'mavsdk_server')
+    except (AttributeError, TypeError):
+        bundled = None
+    if bundled and os.path.exists(bundled):
+        return bundled
+    return shutil.which("mavsdk_server")
+
+
 def _reap_mavsdk_server() -> None:
     """Kill any straggler mavsdk_server processes scoped to current uid.
 
@@ -359,14 +377,9 @@ class DetachedMavsdkServer:
         if self.connection_url.startswith("grpc://"):
             return self.connection_url
 
-        # Try to find mavsdk_server binary
-        try:
-            server_path = os.path.join(os.path.dirname(mavsdk.__file__), 'bin', 'mavsdk_server')
-        except (AttributeError, TypeError):
-            server_path = None
-
-        if not server_path or not os.path.exists(server_path):
-            LOGGER.warning("[drone] mavsdk_server not found at %s, using default System() behavior", server_path)
+        server_path = _find_mavsdk_server()
+        if not server_path:
+            LOGGER.warning("[drone] mavsdk_server not found (mavsdk/bin or PATH), using default System() behavior")
             return self.connection_url  # Fallback to default behavior
 
         # Reap any stale mavsdk_server from a prior run. start_new_session=True
